@@ -1,0 +1,46 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments and Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Data directories (raw and processed data must never be committed)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/**/*.csv
+data/**/*.csv.gz
+data/**/*.parquet
+*.csv.gz
+*.parquet
+
+# Output and Model Artifacts
+outputs/
+models/
+*.joblib
+*.pkl
+
+# Testing and Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# IDE and Editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
