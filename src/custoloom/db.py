@@ -8,7 +8,7 @@ from typing import Any, Optional
 import psycopg
 from psycopg import sql
 
-from custoloom.config import DatabaseConfig, ConfigurationError
+from custoloom.config import DatabaseConfig, ConfigurationError, DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +45,27 @@ def stream_csv_sample(
 class DatabaseManager:
     """Manages PostgreSQL connections and staging operations."""
 
-    def __init__(self, config: Optional[DatabaseConfig] = None):
+    def __init__(
+        self,
+        config: Optional[DatabaseConfig] = None,
+        env_file: Optional[Path] = None,
+    ):
         """Initialize database manager, resolving configuration if not provided."""
         self._config = config
+        self._env_file = env_file
 
     @property
     def config(self) -> DatabaseConfig:
         """Resolve and return database configuration, failing explicitly if unconfigured."""
         if self._config is None:
-            self._config = DatabaseConfig.from_env()
+            self._config = DatabaseConfig.from_env(env_file=self._env_file)
         return self._config
 
     def get_connection(self) -> psycopg.Connection:
-        """Open and return a new psycopg connection using the resolved DSN."""
+        """Open and return a new psycopg connection using the resolved DSN.
+
+        Sanitizes connection errors to ensure passwords/secrets are never exposed.
+        """
         try:
             conn = psycopg.connect(self.config.dsn)
             logger.info(
@@ -68,8 +76,13 @@ class DatabaseManager:
             )
             return conn
         except psycopg.Error as err:
-            logger.error("[ERROR] Failed to connect to PostgreSQL: %s", type(err).__name__)
-            raise
+            err_line = str(err).strip().splitlines()[0] if str(err) else type(err).__name__
+            logger.error("[ERROR] Failed to connect to PostgreSQL: %s", err_line)
+            safe_msg = (
+                f"Failed to connect to PostgreSQL database '{self.config.name}' "
+                f"at {self.config.host}:{self.config.port}: {err_line}"
+            )
+            raise DatabaseConnectionError(safe_msg) from None
 
     def get_server_version(self) -> tuple[str, str, int]:
         """Return server version string, database name, and port (excluding secrets)."""
@@ -97,7 +110,7 @@ class DatabaseManager:
         table_name: str,
         columns: list[str],
         rows: list[list[Any]],
-        conflict_key: Optional[str] = None,
+        conflict_key: Optional[str | list[str]] = None,
         truncate_first: bool = False,
     ) -> int:
         """Safely load sample rows into a table using parameterized insertion.
@@ -115,8 +128,9 @@ class DatabaseManager:
         )
 
         if conflict_key:
-            insert_query += sql.SQL(" ON CONFLICT ({key}) DO NOTHING").format(
-                key=sql.Identifier(conflict_key)
+            conflict_keys = [conflict_key] if isinstance(conflict_key, str) else conflict_key
+            insert_query += sql.SQL(" ON CONFLICT ({keys}) DO NOTHING").format(
+                keys=sql.SQL(", ").join(map(sql.Identifier, conflict_keys))
             )
 
         with self.get_connection() as conn:
@@ -150,6 +164,21 @@ class DatabaseManager:
                 row = cur.fetchone()
                 return row[0] if row else 0
 
+    def inspect_table_exists(self, table_name: str) -> bool:
+        """Check whether a table exists in the public schema."""
+        query = """
+            SELECT EXISTS (
+                SELECT 1 
+                FROM information_schema.tables 
+                WHERE table_name = %s AND table_schema = 'public'
+            );
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (table_name,))
+                row = cur.fetchone()
+                return bool(row[0]) if row else False
+
     def inspect_table_columns(self, table_name: str) -> dict[str, str]:
         """Inspect actual column names and data types from information_schema."""
         query = """
@@ -163,3 +192,74 @@ class DatabaseManager:
                 cur.execute(query, (table_name,))
                 rows = cur.fetchall()
                 return {col: dtype for col, dtype in rows}
+
+
+def load_all_staging_samples(
+    manager: DatabaseManager,
+    raw_data_dir: Path,
+    sample_sizes: Optional[dict[str, int]] = None,
+    truncate_first: bool = False,
+) -> dict[str, int]:
+    """Load configurable small samples into the four staging tables.
+
+    Runs within individual transactions with rollback on failure.
+    Uses ON CONFLICT DO NOTHING on primary keys to avoid duplicate rows on reruns.
+    """
+    sizes = {"clients": 100, "products": 100, "purchases": 100, "uplift_train": 100}
+    if sample_sizes:
+        sizes.update(sample_sizes)
+
+    counts: dict[str, int] = {}
+
+    # 1. Clients
+    clients_file = raw_data_dir / "clients.csv"
+    if clients_file.exists():
+        header, rows = stream_csv_sample(clients_file, max_rows=sizes["clients"], is_gzip=False)
+        manager.load_sample_batch(
+            "stg_clients",
+            header,
+            rows,
+            conflict_key="client_id",
+            truncate_first=truncate_first,
+        )
+        counts["stg_clients"] = manager.fetch_row_count("stg_clients")
+
+    # 2. Products
+    products_file = raw_data_dir / "products.csv"
+    if products_file.exists():
+        header, rows = stream_csv_sample(products_file, max_rows=sizes["products"], is_gzip=False)
+        manager.load_sample_batch(
+            "stg_products",
+            header,
+            rows,
+            conflict_key="product_id",
+            truncate_first=truncate_first,
+        )
+        counts["stg_products"] = manager.fetch_row_count("stg_products")
+
+    # 3. Purchases (streamed from gzip)
+    purchases_file = raw_data_dir / "purchases.csv.gz"
+    if purchases_file.exists():
+        header, rows = stream_csv_sample(purchases_file, max_rows=sizes["purchases"], is_gzip=True)
+        manager.load_sample_batch(
+            "stg_purchases",
+            header,
+            rows,
+            truncate_first=truncate_first,
+        )
+        counts["stg_purchases"] = manager.fetch_row_count("stg_purchases")
+
+    # 4. Uplift train
+    uplift_file = raw_data_dir / "uplift_train.csv"
+    if uplift_file.exists():
+        header, rows = stream_csv_sample(uplift_file, max_rows=sizes["uplift_train"], is_gzip=False)
+        manager.load_sample_batch(
+            "stg_uplift_train",
+            header,
+            rows,
+            conflict_key="client_id",
+            truncate_first=truncate_first,
+        )
+        counts["stg_uplift_train"] = manager.fetch_row_count("stg_uplift_train")
+
+    return counts

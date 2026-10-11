@@ -15,6 +15,11 @@ class ConfigurationError(ValueError):
     pass
 
 
+class DatabaseConnectionError(RuntimeError):
+    """Raised when connecting to PostgreSQL fails."""
+    pass
+
+
 @dataclass(frozen=True)
 class DatabaseConfig:
     """Database connection configuration for PostgreSQL."""
@@ -24,12 +29,14 @@ class DatabaseConfig:
     name: str
     user: str
     password: Optional[str] = None
+    connect_timeout: int = 3
 
     @classmethod
     def from_env(cls, env_file: Optional[Path] = None) -> "DatabaseConfig":
         """Load and validate database configuration from environment variables or .env file."""
-        if env_file and env_file.exists():
-            load_dotenv(env_file, override=True)
+        if env_file is not None:
+            if env_file.exists():
+                load_dotenv(env_file, override=True)
         else:
             load_dotenv()
 
@@ -38,6 +45,7 @@ class DatabaseConfig:
         name = os.getenv("CUSTOLOOM_DB_NAME", os.getenv("DB_NAME", "custoloom"))
         user = os.getenv("CUSTOLOOM_DB_USER", os.getenv("DB_USER"))
         password = os.getenv("CUSTOLOOM_DB_PASSWORD", os.getenv("DB_PASSWORD"))
+        timeout_raw = os.getenv("CUSTOLOOM_DB_CONNECT_TIMEOUT", "3")
 
         missing = []
         if not user:
@@ -55,14 +63,19 @@ class DatabaseConfig:
         except ValueError as err:
             raise ConfigurationError(f"Invalid DB_PORT value: {port_raw}") from err
 
-        return cls(host=host, port=port, name=name, user=user, password=password)
+        try:
+            timeout = int(timeout_raw)
+        except ValueError:
+            timeout = 3
+
+        return cls(host=host, port=port, name=name, user=user, password=password, connect_timeout=timeout)
 
     @property
     def dsn(self) -> str:
         """Construct a libpq connection string."""
         return (
             f"host={self.host} port={self.port} dbname={self.name} "
-            f"user={self.user} password={self.password}"
+            f"user={self.user} password={self.password} connect_timeout={self.connect_timeout}"
         )
 
     def safe_summary(self) -> dict[str, str | int | bool]:

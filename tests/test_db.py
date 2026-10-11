@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 from psycopg import sql
 
-from custoloom.config import ConfigurationError, DatabaseConfig
-from custoloom.db import DatabaseManager, stream_csv_sample
+from custoloom.config import ConfigurationError, DatabaseConfig, DatabaseConnectionError
+from custoloom.db import DatabaseManager, stream_csv_sample, load_all_staging_samples
 
 RAW_DATA_DIR = Path("D:/DA projects/optispend-engine/data/raw")
 SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
@@ -82,50 +82,75 @@ def test_stream_csv_sample_purchases_gzip():
             pytest.fail("Empty string was not converted to None (SQL NULL)")
 
 
-def test_database_manager_fails_cleanly_when_unconfigured():
+def test_database_manager_fails_cleanly_when_unconfigured(tmp_path, monkeypatch):
     """Verify DatabaseManager raises ConfigurationError when settings are absent."""
-    env_backup = dict(os.environ)
-    try:
-        os.environ.pop("CUSTOLOOM_DB_USER", None)
-        os.environ.pop("DB_USER", None)
-        os.environ.pop("CUSTOLOOM_DB_PASSWORD", None)
-        os.environ.pop("DB_PASSWORD", None)
+    empty_env = tmp_path / ".env.empty"
+    empty_env.write_text("", encoding="utf-8")
+    monkeypatch.delenv("CUSTOLOOM_DB_USER", raising=False)
+    monkeypatch.delenv("DB_USER", raising=False)
+    monkeypatch.delenv("CUSTOLOOM_DB_PASSWORD", raising=False)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
 
-        manager = DatabaseManager()
-        with pytest.raises(ConfigurationError, match="Missing required database settings"):
-            _ = manager.config
-    finally:
-        os.environ.clear()
-        os.environ.update(env_backup)
+    manager = DatabaseManager(env_file=empty_env)
+    with pytest.raises(ConfigurationError, match="Missing required database settings"):
+        _ = manager.config
+
+
+def test_failed_connection_produces_safe_error():
+    """Verify that a failed connection produces a clear, safe error without leaking passwords."""
+    cfg = DatabaseConfig(
+        host="127.0.0.1",
+        port=59999,
+        name="nonexistent_db",
+        user="test_user",
+        password="super_secret_password_12345",
+        connect_timeout=1,
+    )
+    manager = DatabaseManager(config=cfg)
+    with pytest.raises(DatabaseConnectionError) as exc_info:
+        manager.get_connection()
+
+    err_str = str(exc_info.value)
+    assert "super_secret_password_12345" not in err_str
+    assert "nonexistent_db" in err_str
+    assert "59999" in err_str
 
 
 def test_postgres_integration_status():
-    """Verify integration test state: runs if credentials configured, explicitly blocked otherwise."""
-    user = os.getenv("CUSTOLOOM_DB_USER", os.getenv("DB_USER"))
-    password = os.getenv("CUSTOLOOM_DB_PASSWORD", os.getenv("DB_PASSWORD"))
+    """Verify integration test state: executes migration & validation if target DB is reachable, skips cleanly if blocked."""
+    try:
+        manager = DatabaseManager()
+        _ = manager.config
+    except ConfigurationError as err:
+        pytest.skip(f"PostgreSQL live integration blocked: {err}")
 
-    if not user or not password:
-        missing = []
-        if not user:
-            missing.append("CUSTOLOOM_DB_USER / DB_USER")
-        if not password:
-            missing.append("CUSTOLOOM_DB_PASSWORD / DB_PASSWORD")
+    try:
+        server_ver, db_name, port = manager.get_server_version()
+    except DatabaseConnectionError as err:
+        pytest.skip(f"PostgreSQL live integration blocked: {err}")
 
-        pytest.skip(
-            f"PostgreSQL live integration blocked: missing required settings ({', '.join(missing)})."
-        )
-
-    # When credentials are provided, test live connection and table migration
-    manager = DatabaseManager()
-    server_ver, db_name, port = manager.get_server_version()
     assert server_ver is not None
     assert db_name == manager.config.name
     assert port == manager.config.port
 
-    # Execute staging DDL
+    # Verify existing tables safely without dropping
+    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
+        manager.inspect_table_exists(tbl)
+
+    # Execute staging DDL safely
     manager.execute_script(SQL_SCRIPT)
 
     # Verify tables created
     for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
         cols = manager.inspect_table_columns(tbl)
         assert len(cols) > 0, f"Table {tbl} has no columns or does not exist."
+
+    # Load and verify small staging samples
+    counts = load_all_staging_samples(
+        manager,
+        RAW_DATA_DIR,
+        sample_sizes={"clients": 50, "products": 50, "purchases": 50, "uplift_train": 50},
+        truncate_first=True,
+    )
+    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
+        assert counts.get(tbl, 0) == 50, f"Unexpected row count for {tbl}: {counts.get(tbl)}"

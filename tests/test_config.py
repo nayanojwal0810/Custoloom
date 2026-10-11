@@ -6,20 +6,17 @@ import pytest
 from custoloom.config import DatabaseConfig, ConfigurationError, AppConfig
 
 
-def test_database_config_missing_credentials():
+def test_database_config_missing_credentials(tmp_path, monkeypatch):
     """Verify that DatabaseConfig raises ConfigurationError when credentials are missing."""
-    env_backup = dict(os.environ)
-    try:
-        os.environ.pop("CUSTOLOOM_DB_USER", None)
-        os.environ.pop("DB_USER", None)
-        os.environ.pop("CUSTOLOOM_DB_PASSWORD", None)
-        os.environ.pop("DB_PASSWORD", None)
+    empty_env = tmp_path / ".env.empty"
+    empty_env.write_text("", encoding="utf-8")
+    monkeypatch.delenv("CUSTOLOOM_DB_USER", raising=False)
+    monkeypatch.delenv("DB_USER", raising=False)
+    monkeypatch.delenv("CUSTOLOOM_DB_PASSWORD", raising=False)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
 
-        with pytest.raises(ConfigurationError, match="Missing required database settings"):
-            DatabaseConfig.from_env()
-    finally:
-        os.environ.clear()
-        os.environ.update(env_backup)
+    with pytest.raises(ConfigurationError, match="Missing required database settings"):
+        DatabaseConfig.from_env(env_file=empty_env)
 
 
 def test_database_config_valid(monkeypatch):
