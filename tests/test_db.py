@@ -6,7 +6,7 @@ import pytest
 from psycopg import sql
 
 from custoloom.config import ConfigurationError, DatabaseConfig, DatabaseConnectionError
-from custoloom.db import DatabaseManager, stream_csv_sample, load_all_staging_samples
+from custoloom.db import DatabaseManager, stream_csv_sample
 
 RAW_DATA_DIR = Path("D:/DA projects/optispend-engine/data/raw")
 SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
@@ -117,7 +117,10 @@ def test_failed_connection_produces_safe_error():
 
 
 def test_postgres_integration_status():
-    """Verify integration test state: executes migration & validation if target DB is reachable, skips cleanly if blocked."""
+    """Verify live PostgreSQL connection and staging schemas read-only.
+
+    Ordinary pytest runs do not create databases or modify real staging data.
+    """
     try:
         manager = DatabaseManager()
         _ = manager.config
@@ -133,24 +136,11 @@ def test_postgres_integration_status():
     assert db_name == manager.config.name
     assert port == manager.config.port
 
-    # Verify existing tables safely without dropping
+    # Verify staging tables and schemas read-only without dropping, truncating, or writing
     for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
-        manager.inspect_table_exists(tbl)
-
-    # Execute staging DDL safely
-    manager.execute_script(SQL_SCRIPT)
-
-    # Verify tables created
-    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
+        assert manager.inspect_table_exists(tbl), f"Staging table {tbl} does not exist in {db_name}"
         cols = manager.inspect_table_columns(tbl)
-        assert len(cols) > 0, f"Table {tbl} has no columns or does not exist."
-
-    # Load and verify small staging samples
-    counts = load_all_staging_samples(
-        manager,
-        RAW_DATA_DIR,
-        sample_sizes={"clients": 50, "products": 50, "purchases": 50, "uplift_train": 50},
-        truncate_first=True,
-    )
-    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
-        assert counts.get(tbl, 0) == 50, f"Unexpected row count for {tbl}: {counts.get(tbl)}"
+        assert len(cols) > 0, f"Table {tbl} has no columns."
+        # Verify row count is queryable without altering table content
+        count = manager.fetch_row_count(tbl)
+        assert count >= 0
