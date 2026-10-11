@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 import psycopg
+from psycopg import sql
 
 from custoloom.config import DatabaseConfig, ConfigurationError
 
@@ -33,7 +34,7 @@ def stream_csv_sample(
             sample_rows.append(cleaned_row)
 
     logger.info(
-        "Read %d sample rows from %s (columns: %d)",
+        "[INFO] Read %d sample rows from %s (columns: %d)",
         len(sample_rows),
         file_path.name,
         len(header),
@@ -60,15 +61,24 @@ class DatabaseManager:
         try:
             conn = psycopg.connect(self.config.dsn)
             logger.info(
-                "Connected to PostgreSQL database: %s on %s:%d",
+                "[INFO] Connected to PostgreSQL database: %s on %s:%d",
                 self.config.name,
                 self.config.host,
                 self.config.port,
             )
             return conn
         except psycopg.Error as err:
-            logger.error("Failed to connect to PostgreSQL: %s", type(err).__name__)
+            logger.error("[ERROR] Failed to connect to PostgreSQL: %s", type(err).__name__)
             raise
+
+    def get_server_version(self) -> tuple[str, str, int]:
+        """Return server version string, database name, and port (excluding secrets)."""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version();")
+                row = cur.fetchone()
+                version_str = row[0] if row else "unknown"
+                return version_str, self.config.name, self.config.port
 
     def execute_script(self, script_path: Path) -> None:
         """Execute a DDL/SQL script file within a single transaction."""
@@ -77,38 +87,79 @@ class DatabaseManager:
 
         sql_content = script_path.read_text(encoding="utf-8")
         with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql_content)
-            conn.commit()
-        logger.info("Successfully executed script: %s", script_path.name)
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(sql_content)
+        logger.info("[INFO] Successfully executed script: %s", script_path.name)
 
-    def insert_sample_rows(
+    def load_sample_batch(
         self,
         table_name: str,
         columns: list[str],
         rows: list[list[Any]],
+        conflict_key: Optional[str] = None,
+        truncate_first: bool = False,
     ) -> int:
-        """Insert sample rows using parameterized query."""
+        """Safely load sample rows into a table using parameterized insertion.
+
+        Identifiers are safely quoted via psycopg.sql.Identifier. The operation
+        runs within a transaction, rolling back on error.
+        """
         if not rows:
             return 0
 
-        col_str = ", ".join(columns)
-        placeholders = ", ".join(["%s"] * len(columns))
-        sql = f"INSERT INTO {table_name} ({col_str}) VALUES ({placeholders})"
+        insert_query = sql.SQL("INSERT INTO {table} ({fields}) VALUES ({values})").format(
+            table=sql.Identifier(table_name),
+            fields=sql.SQL(", ").join(map(sql.Identifier, columns)),
+            values=sql.SQL(", ").join(sql.Placeholder() * len(columns)),
+        )
+
+        if conflict_key:
+            insert_query += sql.SQL(" ON CONFLICT ({key}) DO NOTHING").format(
+                key=sql.Identifier(conflict_key)
+            )
 
         with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.executemany(sql, rows)
-            conn.commit()
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if truncate_first:
+                        cur.execute(
+                            sql.SQL("TRUNCATE TABLE {table}").format(
+                                table=sql.Identifier(table_name)
+                            )
+                        )
+                    cur.executemany(insert_query, rows)
 
-        logger.info("Inserted %d sample rows into %s", len(rows), table_name)
+        logger.info(
+            "[INFO] Loaded %d sample rows into %s (truncate=%s, conflict_key=%s)",
+            len(rows),
+            table_name,
+            truncate_first,
+            conflict_key,
+        )
         return len(rows)
 
     def fetch_row_count(self, table_name: str) -> int:
         """Query and return the current row count of a table."""
-        query = f"SELECT COUNT(*) FROM {table_name}"
+        count_query = sql.SQL("SELECT COUNT(*) FROM {table}").format(
+            table=sql.Identifier(table_name)
+        )
         with self.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query)
+                cur.execute(count_query)
                 row = cur.fetchone()
                 return row[0] if row else 0
+
+    def inspect_table_columns(self, table_name: str) -> dict[str, str]:
+        """Inspect actual column names and data types from information_schema."""
+        query = """
+            SELECT column_name, data_type 
+            FROM information_schema.columns 
+            WHERE table_name = %s 
+            ORDER BY ordinal_position;
+        """
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (table_name,))
+                rows = cur.fetchall()
+                return {col: dtype for col, dtype in rows}

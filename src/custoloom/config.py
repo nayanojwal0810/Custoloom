@@ -26,8 +26,13 @@ class DatabaseConfig:
     password: Optional[str] = None
 
     @classmethod
-    def from_env(cls) -> "DatabaseConfig":
-        """Load and validate database configuration from environment variables."""
+    def from_env(cls, env_file: Optional[Path] = None) -> "DatabaseConfig":
+        """Load and validate database configuration from environment variables or .env file."""
+        if env_file and env_file.exists():
+            load_dotenv(env_file, override=True)
+        else:
+            load_dotenv()
+
         host = os.getenv("CUSTOLOOM_DB_HOST", os.getenv("DB_HOST", "localhost"))
         port_raw = os.getenv("CUSTOLOOM_DB_PORT", os.getenv("DB_PORT", "5432"))
         name = os.getenv("CUSTOLOOM_DB_NAME", os.getenv("DB_NAME", "custoloom"))
@@ -84,7 +89,7 @@ class AppConfig:
     def load(cls, env_file: Optional[Path] = None) -> "AppConfig":
         """Initialize configuration, optionally loading from a .env file."""
         if env_file and env_file.exists():
-            load_dotenv(env_file)
+            load_dotenv(env_file, override=True)
         else:
             load_dotenv()
 

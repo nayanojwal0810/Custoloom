@@ -1,8 +1,9 @@
-"""Tests for database utilities and safe sample data streaming."""
+"""Tests for database utilities, safe sample streaming, and staging migrations."""
 
 import os
 from pathlib import Path
 import pytest
+from psycopg import sql
 
 from custoloom.config import ConfigurationError, DatabaseConfig
 from custoloom.db import DatabaseManager, stream_csv_sample
@@ -12,11 +13,12 @@ SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_stagin
 
 
 def test_ddl_script_structure():
-    """Verify that the staging DDL script defines all four required tables."""
+    """Verify that the staging DDL script defines all four required tables safely."""
     assert SQL_SCRIPT.exists(), f"DDL script not found at {SQL_SCRIPT}"
     content = SQL_SCRIPT.read_text(encoding="utf-8")
     for table_name in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
         assert f"CREATE TABLE IF NOT EXISTS {table_name}" in content
+        assert "loaded_at TIMESTAMP" in content
 
 
 def test_stream_csv_sample_clients():
@@ -30,6 +32,22 @@ def test_stream_csv_sample_clients():
     for row in rows:
         assert len(row) == 5
         assert row[0] is not None  # client_id must be populated
+
+
+def test_stream_csv_sample_products_and_uplift():
+    """Verify streaming samples from products and uplift_train datasets."""
+    products_path = RAW_DATA_DIR / "products.csv"
+    header_p, rows_p = stream_csv_sample(products_path, max_rows=10, is_gzip=False)
+    assert header_p[0] == "product_id"
+    assert len(rows_p) == 10
+
+    uplift_path = RAW_DATA_DIR / "uplift_train.csv"
+    header_u, rows_u = stream_csv_sample(uplift_path, max_rows=10, is_gzip=False)
+    assert header_u == ["client_id", "treatment_flg", "target"]
+    assert len(rows_u) == 10
+    for row in rows_u:
+        assert row[1] in ("0", "1")
+        assert row[2] in ("0", "1")
 
 
 def test_stream_csv_sample_purchases_gzip():
@@ -59,6 +77,9 @@ def test_stream_csv_sample_purchases_gzip():
         assert len(row) == 13
         assert row[0] is not None  # client_id
         assert row[1] is not None  # transaction_id
+        # Confirm empty string fields map to None
+        if row[12] == "":
+            pytest.fail("Empty string was not converted to None (SQL NULL)")
 
 
 def test_database_manager_fails_cleanly_when_unconfigured():
@@ -84,11 +105,27 @@ def test_postgres_integration_status():
     password = os.getenv("CUSTOLOOM_DB_PASSWORD", os.getenv("DB_PASSWORD"))
 
     if not user or not password:
+        missing = []
+        if not user:
+            missing.append("CUSTOLOOM_DB_USER / DB_USER")
+        if not password:
+            missing.append("CUSTOLOOM_DB_PASSWORD / DB_PASSWORD")
+
         pytest.skip(
-            "PostgreSQL integration blocked: missing DB_USER/DB_PASSWORD environment configuration."
+            f"PostgreSQL live integration blocked: missing required settings ({', '.join(missing)})."
         )
 
-    # If configured, test connection lifecycle safely
+    # When credentials are provided, test live connection and table migration
     manager = DatabaseManager()
-    with manager.get_connection() as conn:
-        assert conn.closed is False
+    server_ver, db_name, port = manager.get_server_version()
+    assert server_ver is not None
+    assert db_name == manager.config.name
+    assert port == manager.config.port
+
+    # Execute staging DDL
+    manager.execute_script(SQL_SCRIPT)
+
+    # Verify tables created
+    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
+        cols = manager.inspect_table_columns(tbl)
+        assert len(cols) > 0, f"Table {tbl} has no columns or does not exist."

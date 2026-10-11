@@ -1,7 +1,8 @@
 """Unit tests for configuration validation."""
 
-import pytest
 import os
+from pathlib import Path
+import pytest
 from custoloom.config import DatabaseConfig, ConfigurationError, AppConfig
 
 
@@ -39,6 +40,31 @@ def test_database_config_valid(monkeypatch):
     assert summary["password_configured"] is True
     # Ensure raw secret is not in the summary dictionary values
     assert "secret123" not in summary.values()
+
+
+def test_database_config_loads_dotenv_file(tmp_path):
+    """Verify that DatabaseConfig.from_env loads variables from an explicit .env file."""
+    env_file = tmp_path / ".env.test"
+    env_file.write_text(
+        "CUSTOLOOM_DB_HOST=127.0.0.1\n"
+        "CUSTOLOOM_DB_PORT=5433\n"
+        "CUSTOLOOM_DB_NAME=custoloom_test\n"
+        "CUSTOLOOM_DB_USER=test_user\n"
+        "CUSTOLOOM_DB_PASSWORD=test_pass\n",
+        encoding="utf-8",
+    )
+
+    env_backup = dict(os.environ)
+    try:
+        cfg = DatabaseConfig.from_env(env_file=env_file)
+        assert cfg.host == "127.0.0.1"
+        assert cfg.port == 5433
+        assert cfg.name == "custoloom_test"
+        assert cfg.user == "test_user"
+        assert cfg.password == "test_pass"
+    finally:
+        os.environ.clear()
+        os.environ.update(env_backup)
 
 
 def test_app_config_defaults():
