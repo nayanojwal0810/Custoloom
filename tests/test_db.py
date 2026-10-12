@@ -195,10 +195,11 @@ def test_duckdb_schema_and_batch_operations():
     assert manager.fetch_row_count("stg_clients") == 2
 
 
+@pytest.mark.integration
 def test_duckdb_persistent_read_only_status():
     """Verify live read-only inspection of persistent DuckDB staging database.
 
-    Ordinary pytest runs do not create databases or modify real staging data.
+    Opt-in integration test: runs only when --run-integration or CUSTOLOOM_RUN_INTEGRATION_TESTS=1.
     """
     manager = DatabaseManager()
     # Confirm database is queryable
@@ -218,4 +219,104 @@ def test_duckdb_persistent_read_only_status():
         basket_check = conn.execute("SELECT client_id, transaction_id, purchase_sum FROM v_baskets LIMIT 1;").fetchone()
         assert basket_check is not None
         assert len(basket_check) == 3
+
+
+def test_v_baskets_multiline_grain_and_invariants(tmp_path):
+    """Verify that v_baskets collapses multi-line baskets into 1 row without multiplying purchase_sum."""
+    db_file = tmp_path / "baskets_test.duckdb"
+    cfg = DatabaseConfig(db_path=db_file)
+    manager = DatabaseManager(config=cfg)
+    manager.execute_script(SQL_SCRIPT)
+
+    # Insert 3 line items belonging to the same basket (client c1, transaction t1)
+    cols = [
+        "source_row_number",
+        "client_id",
+        "transaction_id",
+        "transaction_datetime",
+        "regular_points_received",
+        "express_points_received",
+        "regular_points_spent",
+        "express_points_spent",
+        "purchase_sum",
+        "store_id",
+        "product_id",
+        "product_quantity",
+        "trn_sum_from_iss",
+        "trn_sum_from_red",
+    ]
+    rows = [
+        [1, "c1", "t1", "2019-01-01 10:00:00", 15.0, 0.0, 0.0, 0.0, 350.0, "s1", "p1", 1.0, 100.0, None],
+        [2, "c1", "t1", "2019-01-01 10:00:00", 15.0, 0.0, 0.0, 0.0, 350.0, "s1", "p2", 2.0, 150.0, None],
+        [3, "c1", "t1", "2019-01-01 10:00:00", 15.0, 0.0, 0.0, 0.0, 350.0, "s1", "p3", 1.5, 100.0, None],
+    ]
+    manager.load_sample_batch("stg_purchases", cols, rows)
+
+    with manager.get_connection(read_only=True) as conn:
+        res = conn.execute("""
+            SELECT 
+                client_id, transaction_id, transaction_datetime, store_id, 
+                purchase_sum, regular_points_received, basket_line_count, 
+                basket_quantity, basket_trn_sum_from_iss
+            FROM v_baskets;
+        """).fetchall()
+
+        assert len(res) == 1
+        basket = res[0]
+        assert basket[0] == "c1"
+        assert basket[1] == "t1"
+        assert str(basket[2]) == "2019-01-01 10:00:00"
+        assert basket[3] == "s1"
+        assert basket[4] == 350.0  # NOT multiplied to 1050.0
+        assert basket[5] == 15.0   # NOT multiplied to 45.0
+        assert basket[6] == 3      # Exactly 3 lines
+        assert basket[7] == 4.5    # Sum of quantities (1.0 + 2.0 + 1.5)
+        assert basket[8] == 350.0  # Sum of line item sums
+
+
+def test_v_baskets_inconsistent_attribute_handling(tmp_path):
+    """Verify behavior and invariant detection when synthetic lines in a basket have discordant attributes."""
+    db_file = tmp_path / "inconsistent_test.duckdb"
+    cfg = DatabaseConfig(db_path=db_file)
+    manager = DatabaseManager(config=cfg)
+    manager.execute_script(SQL_SCRIPT)
+
+    cols = [
+        "source_row_number",
+        "client_id",
+        "transaction_id",
+        "transaction_datetime",
+        "regular_points_received",
+        "express_points_received",
+        "regular_points_spent",
+        "express_points_spent",
+        "purchase_sum",
+        "store_id",
+        "product_id",
+        "product_quantity",
+        "trn_sum_from_iss",
+        "trn_sum_from_red",
+    ]
+    # Synthetic inconsistent basket: line 1 reports store s1 / sum 300, line 2 reports store s2 / sum 350
+    rows = [
+        [1, "c1", "t_bad", "2019-01-01 10:00:00", 10.0, 0.0, 0.0, 0.0, 300.0, "s1", "p1", 1.0, 300.0, None],
+        [2, "c1", "t_bad", "2019-01-01 10:05:00", 15.0, 0.0, 0.0, 0.0, 350.0, "s2", "p2", 1.0, 350.0, None],
+    ]
+    manager.load_sample_batch("stg_purchases", cols, rows)
+
+    with manager.get_connection(read_only=True) as conn:
+        # Invariant query accurately detects the divergence
+        inconsistent_stores = conn.execute("""
+            SELECT client_id, transaction_id 
+            FROM stg_purchases 
+            GROUP BY client_id, transaction_id 
+            HAVING COUNT(DISTINCT store_id) > 1;
+        """).fetchall()
+        assert len(inconsistent_stores) == 1
+        assert inconsistent_stores[0] == ("c1", "t_bad")
+
+        # View aggregates using MAX deterministically
+        view_row = conn.execute("SELECT store_id, purchase_sum, basket_line_count FROM v_baskets;").fetchone()
+        assert view_row == ("s2", 350.0, 2)
+
 

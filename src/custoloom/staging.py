@@ -36,6 +36,46 @@ ID_COLUMN_TYPES = {
 }
 
 
+def get_existing_purchase_source_row_numbers(
+    manager: DatabaseManager,
+    candidate_row_numbers: Optional[list[int]] = None,
+) -> set[int]:
+    """Fetch existing source_row_numbers for candidate sample rows.
+
+    Maintains bounded O(sample_size) memory consumption by only querying existing
+    records that match the candidate row numbers, rather than scanning the entire table.
+
+    Raises:
+        RuntimeError: If candidate_row_numbers is None on a table with >10,000 rows,
+                      refusing an unconstrained full-table scan.
+    """
+    if not manager.inspect_table_exists("stg_purchases"):
+        return set()
+
+    with manager.get_connection(read_only=True) as conn:
+        if candidate_row_numbers is not None:
+            if not candidate_row_numbers:
+                return set()
+            placeholders = ", ".join(["?"] * len(candidate_row_numbers))
+            query = f"""
+                SELECT source_row_number 
+                FROM stg_purchases 
+                WHERE source_row_number IN ({placeholders});
+            """
+            rows = conn.execute(query, candidate_row_numbers).fetchall()
+            return {int(r[0]) for r in rows if r[0] is not None}
+
+        count = manager.fetch_row_count("stg_purchases")
+        if count > 10_000:
+            raise RuntimeError(
+                f"Unsafe unconstrained query refused: stg_purchases contains {count:,} rows. "
+                "Provide candidate_row_numbers to bound memory."
+            )
+
+        rows = conn.execute("SELECT source_row_number FROM stg_purchases WHERE source_row_number IS NOT NULL;").fetchall()
+        return {int(r[0]) for r in rows}
+
+
 def get_existing_purchase_keys(
     manager: DatabaseManager,
     candidate_keys: Optional[list[tuple[str, str]]] = None,
@@ -44,6 +84,10 @@ def get_existing_purchase_keys(
 
     Maintains bounded O(sample_size) memory consumption by only querying existing
     records that match the candidate keys, rather than scanning the entire table.
+
+    Raises:
+        RuntimeError: If candidate_keys is None on a table with >10,000 rows,
+                      refusing an unconstrained full-table scan.
     """
     if not manager.inspect_table_exists("stg_purchases"):
         return set()
@@ -62,17 +106,16 @@ def get_existing_purchase_keys(
             rows = conn.execute(query, params).fetchall()
             return {(str(r[0]), str(r[1])) for r in rows}
 
-
         count = manager.fetch_row_count("stg_purchases")
         if count > 10_000:
-            logger.warning(
-                "stg_purchases contains %d rows. Skipping full table scan to maintain bounded memory.",
-                count,
+            raise RuntimeError(
+                f"Unsafe unconstrained query refused: stg_purchases contains {count:,} rows. "
+                "Provide candidate_keys or use source_row_number to bound memory."
             )
-            return set()
 
         rows = conn.execute("SELECT transaction_id, product_id FROM stg_purchases;").fetchall()
         return {(str(r[0]), str(r[1])) for r in rows}
+
 
 
 def inspect_representative_records(manager: DatabaseManager) -> dict[str, dict[str, Any]]:
@@ -129,15 +172,18 @@ def load_staging_samples(
             "total": after_count,
         }
 
-    # 3. stg_purchases (streamed from gzip with bounded candidate key checking)
+    # 3. stg_purchases (streamed from gzip with stable source_row_number deduplication)
     purchases_file = raw_data_dir / "purchases.csv.gz"
     if purchases_file.exists():
         header, rows = stream_csv_sample(purchases_file, max_rows=sample_size, is_gzip=True)
-        candidate_keys = [(str(r[1]), str(r[9])) for r in rows]
-        existing_keys = get_existing_purchase_keys(manager, candidate_keys=candidate_keys)
+        # 1-indexed source row numbers corresponding to stream order from purchases.csv.gz
+        candidate_row_numbers = list(range(1, len(rows) + 1))
+        existing_row_numbers = get_existing_purchase_source_row_numbers(
+            manager, candidate_row_numbers=candidate_row_numbers
+        )
         new_rows = []
         for idx, r in enumerate(rows, start=1):
-            if (str(r[1]), str(r[9])) not in existing_keys:
+            if idx not in existing_row_numbers:
                 new_rows.append([idx] + r)
         before_count = manager.fetch_row_count("stg_purchases")
         if new_rows:
@@ -148,6 +194,7 @@ def load_staging_samples(
             "inserted": len(new_rows),
             "total": after_count,
         }
+
 
     # 4. stg_uplift_train
     uplift_file = raw_data_dir / "uplift_train.csv"
