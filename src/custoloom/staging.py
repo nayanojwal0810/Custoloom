@@ -103,10 +103,13 @@ def load_staging_samples(
     if purchases_file.exists():
         header, rows = stream_csv_sample(purchases_file, max_rows=sample_size, is_gzip=True)
         existing_keys = get_existing_purchase_keys(manager)
-        new_rows = [r for r in rows if (str(r[1]), str(r[9])) not in existing_keys]
+        new_rows = []
+        for idx, r in enumerate(rows, start=1):
+            if (str(r[1]), str(r[9])) not in existing_keys:
+                new_rows.append([idx] + r)
         before_count = manager.fetch_row_count("stg_purchases")
         if new_rows:
-            manager.load_sample_batch("stg_purchases", header, new_rows)
+            manager.load_sample_batch("stg_purchases", ["source_row_number"] + header, new_rows)
         after_count = manager.fetch_row_count("stg_purchases")
         results["stg_purchases"] = {
             "requested": len(rows),

@@ -24,9 +24,12 @@ CREATE TABLE IF NOT EXISTS stg_products (
     loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Note: No primary or unique key on stg_purchases until row grain is established.
--- Preserves 100% of source records without dropping duplicates.
+-- Note: No primary or unique key on stg_purchases.
+-- (transaction_id, product_id) is NOT unique across distinct baskets/stores.
+-- source_row_number BIGINT is generated via WITH ORDINALITY from purchases.csv.gz
+-- to preserve each source record's exact row identity and original file order.
 CREATE TABLE IF NOT EXISTS stg_purchases (
+    source_row_number BIGINT,
     client_id VARCHAR,
     transaction_id VARCHAR,
     transaction_datetime TIMESTAMP,

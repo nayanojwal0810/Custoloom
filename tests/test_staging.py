@@ -9,6 +9,29 @@ from custoloom.config import DatabaseConfig
 from custoloom.db import DatabaseManager
 from custoloom.staging import get_existing_purchase_keys, inspect_representative_records
 
+SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
+
+
+@pytest.fixture
+def isolated_staging_manager(tmp_path):
+    """Provide an isolated DuckDB manager with staging DDL and minimal sample data."""
+    db_file = tmp_path / "staging_test.duckdb"
+    cfg = DatabaseConfig(db_path=db_file)
+    mgr = DatabaseManager(config=cfg)
+    mgr.execute_script(SQL_SCRIPT)
+
+    # Insert sample rows for representative inspection
+    mgr.load_sample_batch("stg_clients", ["client_id", "age", "gender"], [["c1", 30, "M"]])
+    mgr.load_sample_batch("stg_products", ["product_id", "level_1"], [["p1", "Cat1"]])
+    mgr.load_sample_batch(
+        "stg_purchases",
+        ["source_row_number", "client_id", "transaction_id", "product_id"],
+        [[1, "c1", "t1", "p1"], [2, "c1", "t2", "p2"]],
+    )
+    mgr.load_sample_batch("stg_uplift_train", ["client_id", "treatment_flg", "target"], [["c1", 1, 0]])
+    mgr.load_sample_batch("stg_uplift_test", ["client_id"], [["c2"]])
+    return mgr
+
 
 def test_staging_cli_help():
     """Verify that staging CLI help runs without error."""
@@ -19,22 +42,19 @@ def test_staging_cli_help():
     assert "--raw-dir" in res.stdout
 
 
-def test_inspect_representative_records_structure():
-    """Verify representative records inspection returns valid dict structure."""
-    manager = DatabaseManager()
-    reps = inspect_representative_records(manager)
+def test_inspect_representative_records_structure(isolated_staging_manager):
+    """Verify representative records inspection returns valid dict structure on isolated database."""
+    reps = inspect_representative_records(isolated_staging_manager)
     for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train", "stg_uplift_test"):
         assert tbl in reps
         assert isinstance(reps[tbl], dict)
         assert len(reps[tbl]) > 0
 
 
-def test_existing_purchase_keys_query():
+def test_existing_purchase_keys_query(isolated_staging_manager):
     """Verify purchase keys helper returns set of (transaction_id, product_id) tuples."""
-    manager = DatabaseManager()
-    keys = get_existing_purchase_keys(manager)
+    keys = get_existing_purchase_keys(isolated_staging_manager)
     assert isinstance(keys, set)
-    assert len(keys) == 100
-    sample_key = next(iter(keys))
-    assert isinstance(sample_key, tuple)
-    assert len(sample_key) == 2
+    assert len(keys) == 2
+    assert ("t1", "p1") in keys
+    assert ("t2", "p2") in keys
