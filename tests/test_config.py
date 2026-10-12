@@ -63,5 +63,6 @@ def test_app_config_defaults():
     """Verify that AppConfig resolves paths correctly."""
     app_cfg = AppConfig.load()
     assert app_cfg.base_dir.exists()
-    assert app_cfg.data_raw_dir.exists()
+    assert app_cfg.data_raw_dir == (app_cfg.base_dir / "data" / "raw") or app_cfg.data_raw_dir.name == "raw"
     assert "custoloom.duckdb" in str(app_cfg.db.db_path)
+

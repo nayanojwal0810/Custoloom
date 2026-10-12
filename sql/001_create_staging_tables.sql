@@ -78,3 +78,38 @@ SELECT
 FROM stg_purchases
 GROUP BY client_id, transaction_id;
 
+-- Reusable basket-invariant violations view:
+-- Identifies any baskets where header attributes (timestamp, store, purchase_sum, points)
+-- differ across line items within the same (client_id, transaction_id).
+CREATE OR REPLACE VIEW v_basket_invariant_violations AS
+SELECT 
+    client_id,
+    transaction_id,
+    MIN(transaction_datetime) AS min_dt,
+    MAX(transaction_datetime) AS max_dt,
+    MIN(store_id) AS min_store,
+    MAX(store_id) AS max_store,
+    MIN(purchase_sum) AS min_sum,
+    MAX(purchase_sum) AS max_sum,
+    MIN(regular_points_received) AS min_reg_pts_recv,
+    MAX(regular_points_received) AS max_reg_pts_recv,
+    MIN(express_points_received) AS min_exp_pts_recv,
+    MAX(express_points_received) AS max_exp_pts_recv,
+    MIN(regular_points_spent) AS min_reg_pts_spent,
+    MAX(regular_points_spent) AS max_reg_pts_spent,
+    MIN(express_points_spent) AS min_exp_pts_spent,
+    MAX(express_points_spent) AS max_exp_pts_spent,
+    COUNT(*) AS basket_line_count
+FROM stg_purchases
+GROUP BY client_id, transaction_id
+HAVING 
+    MIN(transaction_datetime) != MAX(transaction_datetime)
+    OR MIN(store_id) != MAX(store_id)
+    OR MIN(purchase_sum) != MAX(purchase_sum)
+    OR MIN(regular_points_received) != MAX(regular_points_received)
+    OR MIN(express_points_received) != MAX(express_points_received)
+    OR MIN(regular_points_spent) != MAX(regular_points_spent)
+    OR MIN(express_points_spent) != MAX(express_points_spent);
+
+
+

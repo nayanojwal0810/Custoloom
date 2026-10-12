@@ -8,11 +8,11 @@ import pytest
 from custoloom.config import DatabaseConfig
 from custoloom.db import DatabaseManager
 from custoloom.staging import (
-    get_existing_purchase_keys,
     get_existing_purchase_source_row_numbers,
     inspect_representative_records,
     load_staging_samples,
 )
+
 
 SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
 
@@ -70,18 +70,6 @@ def test_existing_purchase_source_row_numbers_bounded(isolated_staging_manager):
     assert all_rows == {1, 2}
 
 
-def test_candidate_bounded_purchase_keys_query(isolated_staging_manager):
-    """Verify candidate_keys filters existing pairs without scanning irrelevant keys."""
-    candidates = [("t1", "p1"), ("nonexistent_t", "nonexistent_p")]
-    matched = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=candidates)
-    assert matched == {("t1", "p1")}
-    assert ("t2", "p2") not in matched
-
-    # Empty candidates returns empty set safely
-    empty_matched = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=[])
-    assert empty_matched == set()
-
-
 def test_unsafe_purchase_queries_raise_without_writes(monkeypatch, isolated_staging_manager):
     """Verify unsafe unconstrained queries raise RuntimeError on large tables and cause no writes."""
     # Simulate stg_purchases having 45 million rows
@@ -91,13 +79,9 @@ def test_unsafe_purchase_queries_raise_without_writes(monkeypatch, isolated_stag
     with pytest.raises(RuntimeError, match="Unsafe unconstrained query refused"):
         get_existing_purchase_source_row_numbers(isolated_staging_manager, candidate_row_numbers=None)
 
-    # Calling unconstrained purchase_keys raises RuntimeError
-    with pytest.raises(RuntimeError, match="Unsafe unconstrained query refused"):
-        get_existing_purchase_keys(isolated_staging_manager, candidate_keys=None)
-
     # With bounded candidate inputs, queries succeed cleanly
     assert get_existing_purchase_source_row_numbers(isolated_staging_manager, candidate_row_numbers=[1]) == {1}
-    assert get_existing_purchase_keys(isolated_staging_manager, candidate_keys=[("t1", "p1")]) == {("t1", "p1")}
+
 
 
 def test_sample_preserves_duplicate_natural_keys(tmp_path):
@@ -160,5 +144,21 @@ def test_sample_rerun_idempotency_no_duplicates(tmp_path):
     assert res2["stg_purchases"]["requested"] == 2
     assert res2["stg_purchases"]["inserted"] == 0
     assert mgr.fetch_row_count("stg_purchases") == 2  # Untouched total count
+
+
+def test_staging_cli_missing_raw_dir_fails_cleanly(tmp_path):
+    """Verify that staging CLI fails with clear error and zero writes when raw directory is missing."""
+    script_path = Path(__file__).resolve().parent.parent / "src" / "custoloom" / "staging.py"
+    non_existent = tmp_path / "non_existent_raw_dir"
+
+    # Pass nonexistent path explicitly
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--raw-dir", str(non_existent)],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode != 0
+    assert "Raw data directory not found" in res.stderr
+
 
 

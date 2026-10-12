@@ -20,7 +20,6 @@ from custoloom.ingest import (
     promote_load_tables,
 )
 
-RAW_DATA_DIR = Path("D:/DA projects/optispend-engine/data/raw")
 SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
 
 
@@ -41,11 +40,26 @@ def test_expected_headers_specification():
     assert EXPECTED_HEADERS["uplift_test.csv"] == ["client_id"]
 
 
-def test_validate_source_headers_passes():
-    """Verify validate_source_headers successfully validates all raw files."""
-    headers = validate_source_headers(RAW_DATA_DIR)
+def test_validate_source_headers_passes(tmp_path):
+    """Verify validate_source_headers successfully validates all raw files using synthetic fixtures."""
+    raw_dir = tmp_path / "valid_raw"
+    raw_dir.mkdir()
+    (raw_dir / "clients.csv").write_text("client_id,first_issue_date,first_redeem_date,age,gender\n", encoding="utf-8")
+    (raw_dir / "products.csv").write_text("product_id,level_1,level_2,level_3,level_4,segment_id,brand_id,vendor_id,netto,is_own_trademark,is_alcohol\n", encoding="utf-8")
+    (raw_dir / "uplift_train.csv").write_text("client_id,treatment_flg,target\n", encoding="utf-8")
+    (raw_dir / "uplift_test.csv").write_text("client_id\n", encoding="utf-8")
+
+    with gzip.open(raw_dir / "purchases.csv.gz", "wt", encoding="utf-8") as f:
+        f.write(
+            "client_id,transaction_id,transaction_datetime,regular_points_received,express_points_received,"
+            "regular_points_spent,express_points_spent,purchase_sum,store_id,product_id,product_quantity,"
+            "trn_sum_from_iss,trn_sum_from_red\n"
+        )
+
+    headers = validate_source_headers(raw_dir)
     assert len(headers) == 5
     assert "clients.csv" in headers
+
 
 
 def test_validate_source_headers_fails_on_missing_dir(tmp_path):
@@ -83,6 +97,21 @@ def test_ingest_cli_help():
     assert "--validate-staging" in res.stdout
     assert "--full-ingest" in res.stdout
     assert "--sample-size" in res.stdout
+
+
+def test_ingest_cli_missing_raw_dir_fails_cleanly(tmp_path):
+    """Verify that ingest CLI fails with clear error and zero writes when raw directory is missing."""
+    script_path = Path(__file__).resolve().parent.parent / "src" / "custoloom" / "ingest.py"
+    non_existent = tmp_path / "non_existent_raw_dir"
+
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--raw-dir", str(non_existent), "--audit-only"],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode != 0
+    assert "Raw data directory not found" in res.stderr
+
 
 
 def test_source_row_number_ordinality_generation(tmp_path):

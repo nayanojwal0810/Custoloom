@@ -76,45 +76,56 @@ def get_existing_purchase_source_row_numbers(
         return {int(r[0]) for r in rows}
 
 
-def get_existing_purchase_keys(
-    manager: DatabaseManager,
-    candidate_keys: Optional[list[tuple[str, str]]] = None,
-) -> set[tuple[str, str]]:
-    """Fetch existing (transaction_id, product_id) pairs for candidate sample rows.
+def validate_basket_invariants(manager: DatabaseManager) -> dict[str, Any]:
+    """Validate that all baskets in stg_purchases have strictly invariant attributes.
 
-    Maintains bounded O(sample_size) memory consumption by only querying existing
-    records that match the candidate keys, rather than scanning the entire table.
-
-    Raises:
-        RuntimeError: If candidate_keys is None on a table with >10,000 rows,
-                      refusing an unconstrained full-table scan.
+    Queries v_basket_invariant_violations and returns a structured summary report.
     """
     if not manager.inspect_table_exists("stg_purchases"):
-        return set()
+        return {"total_violations": 0, "violations": []}
 
     with manager.get_connection(read_only=True) as conn:
-        if candidate_keys is not None:
-            if not candidate_keys:
-                return set()
-            placeholders = ", ".join(["(?, ?)"] * len(candidate_keys))
-            params = [item for pair in candidate_keys for item in pair]
-            query = f"""
-                SELECT transaction_id, product_id 
-                FROM stg_purchases 
-                WHERE (transaction_id, product_id) IN ({placeholders});
-            """
-            rows = conn.execute(query, params).fetchall()
-            return {(str(r[0]), str(r[1])) for r in rows}
+        query = """
+            SELECT 
+                client_id,
+                transaction_id,
+                min_dt, max_dt,
+                min_store, max_store,
+                min_sum, max_sum,
+                min_reg_pts_recv, max_reg_pts_recv,
+                min_exp_pts_recv, max_exp_pts_recv,
+                min_reg_pts_spent, max_reg_pts_spent,
+                min_exp_pts_spent, max_exp_pts_spent,
+                basket_line_count
+            FROM v_basket_invariant_violations;
+        """
+        rows = conn.execute(query).fetchall()
+        violations = []
+        for r in rows:
+            violations.append({
+                "client_id": r[0],
+                "transaction_id": r[1],
+                "min_dt": str(r[2]),
+                "max_dt": str(r[3]),
+                "min_store": r[4],
+                "max_store": r[5],
+                "min_sum": r[6],
+                "max_sum": r[7],
+                "min_reg_pts_recv": r[8],
+                "max_reg_pts_recv": r[9],
+                "min_exp_pts_recv": r[10],
+                "max_exp_pts_recv": r[11],
+                "min_reg_pts_spent": r[12],
+                "max_reg_pts_spent": r[13],
+                "min_exp_pts_spent": r[14],
+                "max_exp_pts_spent": r[15],
+                "basket_line_count": r[16],
+            })
+        return {
+            "total_violations": len(violations),
+            "violations": violations,
+        }
 
-        count = manager.fetch_row_count("stg_purchases")
-        if count > 10_000:
-            raise RuntimeError(
-                f"Unsafe unconstrained query refused: stg_purchases contains {count:,} rows. "
-                "Provide candidate_keys or use source_row_number to bound memory."
-            )
-
-        rows = conn.execute("SELECT transaction_id, product_id FROM stg_purchases;").fetchall()
-        return {(str(r[0]), str(r[1])) for r in rows}
 
 
 
@@ -237,22 +248,34 @@ def main() -> None:
     parser.add_argument(
         "--raw-dir",
         type=Path,
-        default=Path("D:/DA projects/optispend-engine/data/raw"),
-        help="Path to raw datasets directory",
+        default=None,
+        help="Path to raw datasets directory (or configured via CUSTOLOOM_RAW_DATA_DIR)",
     )
     args = parser.parse_args()
+
+    project_root = Path(__file__).resolve().parents[2]
+    raw_dir = args.raw_dir
+    if raw_dir is None:
+        raw_env = os.getenv("CUSTOLOOM_RAW_DATA_DIR")
+        raw_dir = Path(raw_env) if raw_env else (project_root / "data" / "raw")
+
+    if not raw_dir.exists():
+        raise FileNotFoundError(
+            f"Raw data directory not found or not configured: [{raw_dir}]. "
+            "Specify --raw-dir or set the CUSTOLOOM_RAW_DATA_DIR environment variable."
+        )
 
     manager = DatabaseManager()
     logger.info("Connected to DuckDB at [%s]", manager.config.db_path)
 
     # Initialize staging tables if they don't exist
-    project_root = Path(__file__).resolve().parents[2]
     ddl_path = project_root / "sql" / "001_create_staging_tables.sql"
     if ddl_path.exists():
         manager.execute_script(ddl_path)
 
     logger.info("Starting safe sample load (size: %d rows per file)...", args.sample_size)
-    results = load_staging_samples(manager, args.raw_dir, sample_size=args.sample_size)
+    results = load_staging_samples(manager, raw_dir, sample_size=args.sample_size)
+
 
     print("\n--- Staging Sample Load Summary ---")
     for tbl, counts in results.items():

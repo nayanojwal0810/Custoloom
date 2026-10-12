@@ -676,8 +676,8 @@ def main() -> None:
     parser.add_argument(
         "--raw-dir",
         type=Path,
-        default=Path("D:/DA projects/optispend-engine/data/raw"),
-        help="Path to raw datasets directory",
+        default=None,
+        help="Path to raw datasets directory (or configured via CUSTOLOOM_RAW_DATA_DIR)",
     )
     parser.add_argument(
         "--audit-only",
@@ -702,15 +702,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    project_root = Path(__file__).resolve().parents[2]
+    raw_dir = args.raw_dir
+    if raw_dir is None:
+        raw_env = os.getenv("CUSTOLOOM_RAW_DATA_DIR")
+        raw_dir = Path(raw_env) if raw_env else (project_root / "data" / "raw")
+
+    if not raw_dir.exists():
+        raise FileNotFoundError(
+            f"Raw data directory not found or not configured: [{raw_dir}]. "
+            "Specify --raw-dir or set the CUSTOLOOM_RAW_DATA_DIR environment variable."
+        )
+
     # Validate headers before any operation
-    validate_source_headers(args.raw_dir)
+    validate_source_headers(raw_dir)
 
     if args.audit_only:
-        results = audit_source_datasets(args.raw_dir)
+        results = audit_source_datasets(raw_dir)
         print("\n================ SOURCE DATA & KEY AUDIT REPORT ================")
         import pprint
         pprint.pprint(results)
         return
+
 
     if args.validate_staging:
         manager = DatabaseManager()
@@ -723,7 +736,7 @@ def main() -> None:
 
     if args.full_ingest:
         manager = DatabaseManager()
-        results = run_full_ingestion(manager, args.raw_dir)
+        results = run_full_ingestion(manager, raw_dir)
         print("\n================ FULL INGESTION REPORT ================")
         import pprint
         pprint.pprint(results)
@@ -736,11 +749,12 @@ def main() -> None:
         if ddl_path.exists():
             manager.execute_script(ddl_path)
         logger.info("Loading %d sample rows into DuckDB...", args.sample_size)
-        res = load_staging_samples(manager, args.raw_dir, sample_size=args.sample_size)
+        res = load_staging_samples(manager, raw_dir, sample_size=args.sample_size)
         print("\n=== Sample Staging Results ===")
         import pprint
         pprint.pprint(res)
         return
+
 
     parser.print_help()
 

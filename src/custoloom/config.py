@@ -96,12 +96,12 @@ class AppConfig:
             load_dotenv()
 
         base_dir = Path(os.getenv("CUSTOLOOM_BASE_DIR", Path.cwd()))
-        data_raw = Path(
-            os.getenv("CUSTOLOOM_RAW_DATA_DIR", "D:/DA projects/optispend-engine/data/raw")
-        )
+        data_raw_env = os.getenv("CUSTOLOOM_RAW_DATA_DIR")
+        data_raw = Path(data_raw_env) if data_raw_env else (base_dir / "data" / "raw")
         data_processed = Path(
             os.getenv("CUSTOLOOM_PROCESSED_DATA_DIR", base_dir / "data" / "processed")
         )
+
         db_config = DatabaseConfig.from_env(env_file=env_file)
 
         return cls(
