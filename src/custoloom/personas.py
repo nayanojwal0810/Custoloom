@@ -250,6 +250,9 @@ def generate_personas_sql(
         for persona, policy in a.items()
     )
 
+    if target_table in PROTECTED_TABLES:
+        raise ValueError(f"Cannot generate persona SQL targeting protected table '{target_table}'.")
+
     sql = f"""
     CREATE TABLE {target_table} AS
     WITH classified AS (
@@ -464,16 +467,94 @@ def validate_personas_stage(
     }
 
 
+PROTECTED_TABLES = frozenset([
+    "mart_customer_360",
+    "stg_clients",
+    "stg_products",
+    "stg_purchases",
+    "stg_uplift_train",
+    "stg_uplift_test",
+])
+
+
+def validate_pipeline_table_names(
+    source_table: str,
+    target_table: str,
+    staging_table: str = LOAD_PERSONAS_TABLE,
+) -> None:
+    """Validate table names to prevent dangerous collisions or overwriting protected source tables.
+
+    Raises:
+        ValueError: If any table collision or protected table violation is detected.
+    """
+    if target_table in PROTECTED_TABLES:
+        raise ValueError(
+            f"Configuration error: target_table cannot be protected table '{target_table}'."
+        )
+    if staging_table in PROTECTED_TABLES:
+        raise ValueError(
+            f"Configuration error: staging_table cannot be protected table '{staging_table}'."
+        )
+    if source_table == target_table:
+        raise ValueError(
+            f"Table collision: source_table and target_table cannot both be '{source_table}'."
+        )
+    if source_table == staging_table:
+        raise ValueError(
+            f"Table collision: source_table and staging_table cannot both be '{source_table}'."
+        )
+    if target_table == staging_table:
+        raise ValueError(
+            f"Table collision: target_table and staging_table cannot both be '{target_table}'."
+        )
+
+
 def promote_personas(
     con: duckdb.DuckDBPyConnection,
     load_table: str = LOAD_PERSONAS_TABLE,
     final_table: str = FINAL_PERSONAS_TABLE,
 ) -> None:
-    """Promote load-stage persona table to final production table atomically."""
-    logger.info("Promoting '%s' to '%s'...", load_table, final_table)
-    con.execute(f"DROP TABLE IF EXISTS {final_table};")
-    con.execute(f"ALTER TABLE {load_table} RENAME TO {final_table};")
-    logger.info("Successfully promoted '%s'.", final_table)
+    """Promote load-stage persona table to final production table in a safe DuckDB transaction.
+
+    Checks staging table existence before promotion. Drops existing destination and
+    renames staging table within an explicit transaction. Rolls back on error to preserve
+    the existing destination table.
+
+    Raises:
+        RuntimeError: If staging table does not exist or promotion transaction fails.
+        ValueError: If final_table is a protected table or collides with staging table.
+    """
+    logger.info("Promoting '%s' to '%s' in a safe transaction...", load_table, final_table)
+
+    if final_table in PROTECTED_TABLES:
+        raise ValueError(f"Cannot promote into protected table '{final_table}'.")
+    if load_table == final_table:
+        raise ValueError(f"load_table and final_table cannot be the same: '{load_table}'.")
+
+    # 1. Check that staging table exists before attempting promotion
+    stage_exists = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
+        [load_table],
+    ).fetchone()[0] > 0
+    if not stage_exists:
+        err_msg = f"Promotion failed: required staging table '{load_table}' does not exist."
+        logger.error("[ERROR] %s", err_msg)
+        raise RuntimeError(err_msg)
+
+    # 2. Transaction-wrapped drop and rename
+    con.execute("BEGIN TRANSACTION;")
+    try:
+        con.execute(f"DROP TABLE IF EXISTS {final_table};")
+        con.execute(f"ALTER TABLE {load_table} RENAME TO {final_table};")
+        con.execute("COMMIT;")
+        logger.info("Successfully promoted '%s' to '%s'.", load_table, final_table)
+    except Exception as err:
+        con.execute("ROLLBACK;")
+        err_msg = (
+            f"Promotion of '{load_table}' to '{final_table}' failed; transaction rolled back: {err}"
+        )
+        logger.error("[ERROR] %s", err_msg)
+        raise RuntimeError(err_msg) from err
 
 
 def run_customer_personas_pipeline(
@@ -481,8 +562,16 @@ def run_customer_personas_pipeline(
     thresholds: Optional[PersonaThresholds] = None,
     source_table: str = SOURCE_MART_TABLE,
     target_table: str = FINAL_PERSONAS_TABLE,
+    staging_table: str = LOAD_PERSONAS_TABLE,
 ) -> dict[str, Any]:
     """Execute the end-to-end customer persona classification pipeline."""
+    # Fail before any database operation if table names collide or violate protection
+    validate_pipeline_table_names(
+        source_table=source_table,
+        target_table=target_table,
+        staging_table=staging_table,
+    )
+
     logger.info("Starting Customer Personas pipeline into '%s'...", target_table)
     t_start = time.time()
 
@@ -502,16 +591,16 @@ def run_customer_personas_pipeline(
             conn,
             thresholds=thresholds,
             source_table=source_table,
-            target_table=LOAD_PERSONAS_TABLE,
+            target_table=staging_table,
         )
         val_summary = validate_personas_stage(
             conn,
-            target_table=LOAD_PERSONAS_TABLE,
+            target_table=staging_table,
             source_table=source_table,
         )
         promote_personas(
             conn,
-            load_table=LOAD_PERSONAS_TABLE,
+            load_table=staging_table,
             final_table=target_table,
         )
 

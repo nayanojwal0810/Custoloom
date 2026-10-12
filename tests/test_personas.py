@@ -326,6 +326,76 @@ def test_customer_id_preservation_and_one_row_per_customer(persona_test_db):
     assert src_ids == tgt_ids
 
 
+def test_failed_promotion_preserves_existing_destination_table(persona_test_db):
+    """Verify that promotion failure preserves the existing destination table without loss."""
+    mgr, con = persona_test_db
+    # 1. Establish existing destination table
+    run_customer_personas_pipeline(manager=mgr)
+    baseline_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
+    assert len(baseline_rows) > 0
+
+    # 2. Attempt promotion with missing staging table -> raises RuntimeError, table preserved
+    with pytest.raises(RuntimeError, match="required staging table 'nonexistent_stage' does not exist"):
+        promote_personas(con, load_table="nonexistent_stage", final_table=FINAL_PERSONAS_TABLE)
+
+    after_missing_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
+    assert after_missing_rows == baseline_rows
+
+    # 3. Simulate failure during transaction:
+    # Verify that inside BEGIN TRANSACTION, a rollback restores the dropped final_table
+    con.execute("BEGIN TRANSACTION;")
+    con.execute(f"DROP TABLE IF EXISTS {FINAL_PERSONAS_TABLE};")
+    try:
+        con.execute(f"ALTER TABLE nonexistent_table_for_rollback RENAME TO {FINAL_PERSONAS_TABLE};")
+        con.execute("COMMIT;")
+    except Exception:
+        con.execute("ROLLBACK;")
+
+    # Destination table must be fully restored by ROLLBACK
+    after_rollback_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
+    assert after_rollback_rows == baseline_rows
+
+
+def test_prevent_source_mart_as_target_collision(persona_test_db):
+    """Verify attempts to use mart_customer_360 or protected tables as target fail before writes."""
+    mgr, con = persona_test_db
+
+    # Attempt to target mart_customer_360
+    with pytest.raises(ValueError, match="target_table cannot be protected table 'mart_customer_360'"):
+        run_customer_personas_pipeline(manager=mgr, target_table="mart_customer_360")
+
+    # Attempt to target stg_purchases
+    with pytest.raises(ValueError, match="target_table cannot be protected table 'stg_purchases'"):
+        run_customer_personas_pipeline(manager=mgr, target_table="stg_purchases")
+
+    # Source mart remains unchanged
+    count = con.execute("SELECT COUNT(*) FROM mart_customer_360;").fetchone()[0]
+    assert count == 12
+
+
+def test_prevent_source_staging_destination_name_collisions(persona_test_db):
+    """Verify collisions among source, staging, and destination table names are rejected."""
+    mgr, con = persona_test_db
+
+    # source == target
+    with pytest.raises(ValueError, match="source_table and target_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, source_table="custom_mart", target_table="custom_mart"
+        )
+
+    # staging == target
+    with pytest.raises(ValueError, match="target_table and staging_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, staging_table="mart_customer_personas", target_table="mart_customer_personas"
+        )
+
+    # source == staging
+    with pytest.raises(ValueError, match="source_table and staging_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, source_table="custom_mart", staging_table="custom_mart"
+        )
+
+
 def test_personas_cli_help():
     """Verify personas CLI argument parser works without errors."""
     parsed = parse_args(["--source-table", "custom_mart", "--target-table", "custom_personas"])
