@@ -80,22 +80,25 @@ def validate_basket_invariants(manager: DatabaseManager) -> dict[str, Any]:
     """Validate that all baskets in stg_purchases have strictly invariant attributes.
 
     Queries v_basket_invariant_violations and returns a structured summary report.
+
+    Raises:
+        RuntimeError: If required table 'stg_purchases' does not exist.
     """
     if not manager.inspect_table_exists("stg_purchases"):
-        return {"total_violations": 0, "violations": []}
+        raise RuntimeError("Validation error: required table 'stg_purchases' does not exist.")
 
     with manager.get_connection(read_only=True) as conn:
         query = """
             SELECT 
                 client_id,
                 transaction_id,
-                min_dt, max_dt,
-                min_store, max_store,
-                min_sum, max_sum,
-                min_reg_pts_recv, max_reg_pts_recv,
-                min_exp_pts_recv, max_exp_pts_recv,
-                min_reg_pts_spent, max_reg_pts_spent,
-                min_exp_pts_spent, max_exp_pts_spent,
+                min_dt, max_dt, cnt_dt,
+                min_store, max_store, cnt_store,
+                min_sum, max_sum, cnt_sum,
+                min_reg_pts_recv, max_reg_pts_recv, cnt_reg_pts_recv,
+                min_exp_pts_recv, max_exp_pts_recv, cnt_exp_pts_recv,
+                min_reg_pts_spent, max_reg_pts_spent, cnt_reg_pts_spent,
+                min_exp_pts_spent, max_exp_pts_spent, cnt_exp_pts_spent,
                 basket_line_count
             FROM v_basket_invariant_violations;
         """
@@ -107,24 +110,32 @@ def validate_basket_invariants(manager: DatabaseManager) -> dict[str, Any]:
                 "transaction_id": r[1],
                 "min_dt": str(r[2]),
                 "max_dt": str(r[3]),
-                "min_store": r[4],
-                "max_store": r[5],
-                "min_sum": r[6],
-                "max_sum": r[7],
-                "min_reg_pts_recv": r[8],
-                "max_reg_pts_recv": r[9],
-                "min_exp_pts_recv": r[10],
-                "max_exp_pts_recv": r[11],
-                "min_reg_pts_spent": r[12],
-                "max_reg_pts_spent": r[13],
-                "min_exp_pts_spent": r[14],
-                "max_exp_pts_spent": r[15],
-                "basket_line_count": r[16],
+                "cnt_dt": r[4],
+                "min_store": r[5],
+                "max_store": r[6],
+                "cnt_store": r[7],
+                "min_sum": r[8],
+                "max_sum": r[9],
+                "cnt_sum": r[10],
+                "min_reg_pts_recv": r[11],
+                "max_reg_pts_recv": r[12],
+                "cnt_reg_pts_recv": r[13],
+                "min_exp_pts_recv": r[14],
+                "max_exp_pts_recv": r[15],
+                "cnt_exp_pts_recv": r[16],
+                "min_reg_pts_spent": r[17],
+                "max_reg_pts_spent": r[18],
+                "cnt_reg_pts_spent": r[19],
+                "min_exp_pts_spent": r[20],
+                "max_exp_pts_spent": r[21],
+                "cnt_exp_pts_spent": r[22],
+                "basket_line_count": r[23],
             })
         return {
             "total_violations": len(violations),
             "violations": violations,
         }
+
 
 
 

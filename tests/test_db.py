@@ -132,20 +132,28 @@ def test_staging_ddl_behavioral_schema_validation():
             "transaction_id": "VARCHAR",
             "min_dt": "TIMESTAMP",
             "max_dt": "TIMESTAMP",
+            "cnt_dt": "BIGINT",
             "min_store": "VARCHAR",
             "max_store": "VARCHAR",
+            "cnt_store": "BIGINT",
             "min_sum": "DOUBLE",
             "max_sum": "DOUBLE",
+            "cnt_sum": "BIGINT",
             "min_reg_pts_recv": "DOUBLE",
             "max_reg_pts_recv": "DOUBLE",
+            "cnt_reg_pts_recv": "BIGINT",
             "min_exp_pts_recv": "DOUBLE",
             "max_exp_pts_recv": "DOUBLE",
+            "cnt_exp_pts_recv": "BIGINT",
             "min_reg_pts_spent": "DOUBLE",
             "max_reg_pts_spent": "DOUBLE",
+            "cnt_reg_pts_spent": "BIGINT",
             "min_exp_pts_spent": "DOUBLE",
             "max_exp_pts_spent": "DOUBLE",
+            "cnt_exp_pts_spent": "BIGINT",
             "basket_line_count": "BIGINT",
         },
+
     }
 
     with manager.get_connection(read_only=True) as conn:
@@ -396,6 +404,65 @@ def test_v_baskets_inconsistent_attribute_handling(tmp_path):
         # 3. View aggregates using MAX deterministically
         view_row = conn.execute("SELECT store_id, purchase_sum, basket_line_count FROM v_baskets;").fetchone()
         assert view_row == ("s2", 350.0, 2)
+
+
+def test_v_baskets_partial_null_attribute_handling(tmp_path):
+    """Verify that partially NULL attributes within a basket are flagged as invariant violations."""
+    db_file = tmp_path / "partial_null_test.duckdb"
+    cfg = DatabaseConfig(db_path=db_file)
+    manager = DatabaseManager(config=cfg)
+    manager.execute_script(SQL_SCRIPT)
+
+    cols = [
+        "source_row_number",
+        "client_id",
+        "transaction_id",
+        "transaction_datetime",
+        "regular_points_received",
+        "express_points_received",
+        "regular_points_spent",
+        "express_points_spent",
+        "purchase_sum",
+        "store_id",
+        "product_id",
+        "product_quantity",
+        "trn_sum_from_iss",
+        "trn_sum_from_red",
+    ]
+    # Synthetic basket where line 1 has regular_points_received = 10.0 and line 2 has NULL
+    rows = [
+        [1, "c2", "t_part_null", "2019-01-01 10:00:00", 10.0, 0.0, 0.0, 0.0, 200.0, "s1", "p1", 1.0, 100.0, None],
+        [2, "c2", "t_part_null", "2019-01-01 10:00:00", None, 0.0, 0.0, 0.0, 200.0, "s1", "p2", 1.0, 100.0, None],
+    ]
+    manager.load_sample_batch("stg_purchases", cols, rows)
+
+    # 1. Verify production validation function catches the partial NULL
+    report = validate_basket_invariants(manager)
+    assert report["total_violations"] == 1
+    viol = report["violations"][0]
+    assert viol["client_id"] == "c2"
+    assert viol["transaction_id"] == "t_part_null"
+    assert viol["min_reg_pts_recv"] == 10.0
+    assert viol["max_reg_pts_recv"] == 10.0
+    assert viol["cnt_reg_pts_recv"] == 1  # 1 non-null out of 2 lines
+    assert viol["basket_line_count"] == 2
+
+    # 2. Verify v_basket_invariant_violations view catches the violation
+    with manager.get_connection(read_only=True) as conn:
+        view_viols = conn.execute("SELECT client_id, transaction_id, cnt_reg_pts_recv, basket_line_count FROM v_basket_invariant_violations;").fetchall()
+        assert len(view_viols) == 1
+        assert view_viols[0] == ("c2", "t_part_null", 1, 2)
+
+
+def test_validate_basket_invariants_missing_table_fails(tmp_path):
+    """Verify that validate_basket_invariants reports a validation error when stg_purchases is missing."""
+    empty_db = tmp_path / "empty.duckdb"
+    manager = DatabaseManager(config=DatabaseConfig(db_path=empty_db))
+    # No DDL executed, table stg_purchases does not exist
+
+    with pytest.raises(RuntimeError, match="Validation error: required table 'stg_purchases' does not exist"):
+        validate_basket_invariants(manager)
+
 
 
 
