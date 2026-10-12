@@ -20,6 +20,9 @@ data/**/*.csv.gz
 data/**/*.parquet
 *.csv.gz
 *.parquet
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
 
 # Output and Model Artifacts
 outputs/

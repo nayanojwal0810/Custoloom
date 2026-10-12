@@ -23,7 +23,7 @@ def test_inspect_representative_records_structure():
     """Verify representative records inspection returns valid dict structure."""
     manager = DatabaseManager()
     reps = inspect_representative_records(manager)
-    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train"):
+    for tbl in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train", "stg_uplift_test"):
         assert tbl in reps
         assert isinstance(reps[tbl], dict)
         assert len(reps[tbl]) > 0

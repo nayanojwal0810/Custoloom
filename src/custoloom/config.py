@@ -1,4 +1,4 @@
-"""Application and database configuration management."""
+"""Application and DuckDB database configuration management."""
 
 import logging
 import os
@@ -16,76 +16,64 @@ class ConfigurationError(ValueError):
 
 
 class DatabaseConnectionError(RuntimeError):
-    """Raised when connecting to PostgreSQL fails."""
+    """Raised when connecting to DuckDB fails."""
     pass
 
 
 @dataclass(frozen=True)
 class DatabaseConfig:
-    """Database connection configuration for PostgreSQL."""
+    """Database configuration for persistent or in-memory DuckDB."""
 
-    host: str
-    port: int
-    name: str
-    user: str
-    password: Optional[str] = None
-    connect_timeout: int = 3
+    db_path: Path
+    threads: Optional[int] = None
+    memory_limit: Optional[str] = None
+    temp_directory: Optional[Path] = None
 
     @classmethod
     def from_env(cls, env_file: Optional[Path] = None) -> "DatabaseConfig":
-        """Load and validate database configuration from environment variables or .env file."""
+        """Load and validate DuckDB configuration from environment variables or .env file."""
         if env_file is not None:
             if env_file.exists():
                 load_dotenv(env_file, override=True)
         else:
             load_dotenv()
 
-        host = os.getenv("CUSTOLOOM_DB_HOST", os.getenv("DB_HOST", "localhost"))
-        port_raw = os.getenv("CUSTOLOOM_DB_PORT", os.getenv("DB_PORT", "5432"))
-        name = os.getenv("CUSTOLOOM_DB_NAME", os.getenv("DB_NAME", "custoloom"))
-        user = os.getenv("CUSTOLOOM_DB_USER", os.getenv("DB_USER"))
-        password = os.getenv("CUSTOLOOM_DB_PASSWORD", os.getenv("DB_PASSWORD"))
-        timeout_raw = os.getenv("CUSTOLOOM_DB_CONNECT_TIMEOUT", "3")
+        base_dir = Path(os.getenv("CUSTOLOOM_BASE_DIR", Path.cwd()))
+        default_db = base_dir / "data" / "processed" / "custoloom.duckdb"
+        db_path_raw = os.getenv("CUSTOLOOM_DB_PATH", os.getenv("DUCKDB_PATH", str(default_db)))
 
-        missing = []
-        if not user:
-            missing.append("DB_USER (or CUSTOLOOM_DB_USER)")
-        if not password:
-            missing.append("DB_PASSWORD (or CUSTOLOOM_DB_PASSWORD)")
+        if db_path_raw == ":memory:":
+            db_path = Path(":memory:")
+        else:
+            db_path = Path(db_path_raw)
 
-        if missing:
-            raise ConfigurationError(
-                f"Missing required database settings: {', '.join(missing)}"
-            )
+        threads_raw = os.getenv("CUSTOLOOM_DB_THREADS", os.getenv("DUCKDB_THREADS"))
+        threads = None
+        if threads_raw:
+            try:
+                threads = int(threads_raw)
+            except ValueError as err:
+                raise ConfigurationError(f"Invalid CUSTOLOOM_DB_THREADS: {threads_raw}") from err
 
-        try:
-            port = int(port_raw)
-        except ValueError as err:
-            raise ConfigurationError(f"Invalid DB_PORT value: {port_raw}") from err
+        memory_limit = os.getenv("CUSTOLOOM_DB_MEMORY_LIMIT", os.getenv("DUCKDB_MEMORY_LIMIT"))
 
-        try:
-            timeout = int(timeout_raw)
-        except ValueError:
-            timeout = 3
+        temp_dir_raw = os.getenv("CUSTOLOOM_DB_TEMP_DIR")
+        temp_dir = Path(temp_dir_raw) if temp_dir_raw else None
 
-        return cls(host=host, port=port, name=name, user=user, password=password, connect_timeout=timeout)
-
-    @property
-    def dsn(self) -> str:
-        """Construct a libpq connection string."""
-        return (
-            f"host={self.host} port={self.port} dbname={self.name} "
-            f"user={self.user} password={self.password} connect_timeout={self.connect_timeout}"
+        return cls(
+            db_path=db_path,
+            threads=threads,
+            memory_limit=memory_limit,
+            temp_directory=temp_dir,
         )
 
-    def safe_summary(self) -> dict[str, str | int | bool]:
+    def safe_summary(self) -> dict[str, str | int | None]:
         """Return non-sensitive connection details for logging/diagnostics."""
         return {
-            "host": self.host,
-            "port": self.port,
-            "database": self.name,
-            "user": self.user,
-            "password_configured": bool(self.password),
+            "db_path": str(self.db_path),
+            "threads": self.threads,
+            "memory_limit": self.memory_limit,
+            "temp_directory": str(self.temp_directory) if self.temp_directory else None,
         }
 
 
@@ -96,26 +84,29 @@ class AppConfig:
     base_dir: Path
     data_raw_dir: Path
     data_processed_dir: Path
-    environment: str
+    db: DatabaseConfig
 
     @classmethod
     def load(cls, env_file: Optional[Path] = None) -> "AppConfig":
         """Initialize configuration, optionally loading from a .env file."""
-        if env_file and env_file.exists():
-            load_dotenv(env_file, override=True)
+        if env_file is not None:
+            if env_file.exists():
+                load_dotenv(env_file, override=True)
         else:
             load_dotenv()
 
         base_dir = Path(os.getenv("CUSTOLOOM_BASE_DIR", Path.cwd()))
-        data_raw = Path(os.getenv("CUSTOLOOM_RAW_DATA_DIR", base_dir / "data" / "raw"))
+        data_raw = Path(
+            os.getenv("CUSTOLOOM_RAW_DATA_DIR", "D:/DA projects/optispend-engine/data/raw")
+        )
         data_processed = Path(
             os.getenv("CUSTOLOOM_PROCESSED_DATA_DIR", base_dir / "data" / "processed")
         )
-        environment = os.getenv("CUSTOLOOM_ENV", "development")
+        db_config = DatabaseConfig.from_env(env_file=env_file)
 
         return cls(
             base_dir=base_dir,
             data_raw_dir=data_raw,
             data_processed_dir=data_processed,
-            environment=environment,
+            db=db_config,
         )
