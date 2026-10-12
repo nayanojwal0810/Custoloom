@@ -57,3 +57,24 @@ CREATE TABLE IF NOT EXISTS stg_uplift_test (
     client_id VARCHAR PRIMARY KEY,
     loaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Canonical basket-level view:
+-- Evaluates purchases at the true basket grain: (client_id, transaction_id).
+-- purchase_sum and loyalty points are constant within each basket and are aggregated once (MAX)
+-- to protect downstream queries from multiplying basket totals across line items.
+CREATE OR REPLACE VIEW v_baskets AS
+SELECT 
+    client_id,
+    transaction_id,
+    MAX(transaction_datetime) AS transaction_datetime,
+    MAX(store_id) AS store_id,
+    MAX(purchase_sum) AS purchase_sum,
+    MAX(regular_points_received) AS regular_points_received,
+    MAX(regular_points_spent) AS regular_points_spent,
+    COUNT(*) AS basket_line_count,
+    ROUND(SUM(product_quantity), 2) AS basket_quantity,
+    ROUND(SUM(trn_sum_from_iss), 2) AS basket_trn_sum_from_iss,
+    ROUND(SUM(trn_sum_from_red), 2) AS basket_trn_sum_from_red
+FROM stg_purchases
+GROUP BY client_id, transaction_id;
+

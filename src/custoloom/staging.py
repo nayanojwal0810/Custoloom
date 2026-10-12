@@ -36,11 +36,42 @@ ID_COLUMN_TYPES = {
 }
 
 
-def get_existing_purchase_keys(manager: DatabaseManager) -> set[tuple[str, str]]:
-    """Fetch existing (transaction_id, product_id) pairs to avoid duplicate sample rows."""
-    query = "SELECT transaction_id, product_id FROM stg_purchases;"
+def get_existing_purchase_keys(
+    manager: DatabaseManager,
+    candidate_keys: Optional[list[tuple[str, str]]] = None,
+) -> set[tuple[str, str]]:
+    """Fetch existing (transaction_id, product_id) pairs for candidate sample rows.
+
+    Maintains bounded O(sample_size) memory consumption by only querying existing
+    records that match the candidate keys, rather than scanning the entire table.
+    """
+    if not manager.inspect_table_exists("stg_purchases"):
+        return set()
+
     with manager.get_connection(read_only=True) as conn:
-        rows = conn.execute(query).fetchall()
+        if candidate_keys is not None:
+            if not candidate_keys:
+                return set()
+            placeholders = ", ".join(["(?, ?)"] * len(candidate_keys))
+            params = [item for pair in candidate_keys for item in pair]
+            query = f"""
+                SELECT transaction_id, product_id 
+                FROM stg_purchases 
+                WHERE (transaction_id, product_id) IN ({placeholders});
+            """
+            rows = conn.execute(query, params).fetchall()
+            return {(str(r[0]), str(r[1])) for r in rows}
+
+
+        count = manager.fetch_row_count("stg_purchases")
+        if count > 10_000:
+            logger.warning(
+                "stg_purchases contains %d rows. Skipping full table scan to maintain bounded memory.",
+                count,
+            )
+            return set()
+
+        rows = conn.execute("SELECT transaction_id, product_id FROM stg_purchases;").fetchall()
         return {(str(r[0]), str(r[1])) for r in rows}
 
 
@@ -65,7 +96,7 @@ def load_staging_samples(
     """Load small, repeatable samples into the DuckDB staging tables.
 
     Uses ON CONFLICT DO NOTHING for tables with primary keys, and checks
-    existing candidate pairs for stg_purchases to avoid duplicates on rerun.
+    candidate pairs for stg_purchases to avoid duplicates on rerun.
     """
     if not raw_data_dir.exists():
         raise FileNotFoundError(f"Raw data directory not found: {raw_data_dir}")
@@ -98,11 +129,12 @@ def load_staging_samples(
             "total": after_count,
         }
 
-    # 3. stg_purchases (streamed from gzip)
+    # 3. stg_purchases (streamed from gzip with bounded candidate key checking)
     purchases_file = raw_data_dir / "purchases.csv.gz"
     if purchases_file.exists():
         header, rows = stream_csv_sample(purchases_file, max_rows=sample_size, is_gzip=True)
-        existing_keys = get_existing_purchase_keys(manager)
+        candidate_keys = [(str(r[1]), str(r[9])) for r in rows]
+        existing_keys = get_existing_purchase_keys(manager, candidate_keys=candidate_keys)
         new_rows = []
         for idx, r in enumerate(rows, start=1):
             if (str(r[1]), str(r[9])) not in existing_keys:

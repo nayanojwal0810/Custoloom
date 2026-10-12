@@ -58,3 +58,31 @@ def test_existing_purchase_keys_query(isolated_staging_manager):
     assert len(keys) == 2
     assert ("t1", "p1") in keys
     assert ("t2", "p2") in keys
+
+
+def test_candidate_bounded_purchase_keys_query(isolated_staging_manager):
+    """Verify candidate_keys filters existing pairs without scanning irrelevant keys."""
+    candidates = [("t1", "p1"), ("nonexistent_t", "nonexistent_p")]
+    matched = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=candidates)
+    assert matched == {("t1", "p1")}
+    assert ("t2", "p2") not in matched
+
+    # Empty candidates returns empty set safely
+    empty_matched = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=[])
+    assert empty_matched == set()
+
+
+def test_unbounded_safety_threshold_purchase_keys(monkeypatch, isolated_staging_manager):
+    """Verify full table scan is avoided if table size exceeds safe memory threshold."""
+    # Simulate stg_purchases having 45 million rows
+    monkeypatch.setattr(isolated_staging_manager, "fetch_row_count", lambda tbl: 45_788_000)
+    
+    # Without candidate_keys, it should safely return empty set and not scan
+    keys = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=None)
+    assert keys == set()
+
+    # With candidate_keys, it should execute the bounded query despite high total table count
+    candidates = [("t1", "p1")]
+    keys_bounded = get_existing_purchase_keys(isolated_staging_manager, candidate_keys=candidates)
+    assert keys_bounded == {("t1", "p1")}
+

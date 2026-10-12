@@ -10,13 +10,85 @@ RAW_DATA_DIR = Path("D:/DA projects/optispend-engine/data/raw")
 SQL_SCRIPT = Path(__file__).resolve().parent.parent / "sql" / "001_create_staging_tables.sql"
 
 
-def test_ddl_script_structure():
-    """Verify that the staging DDL script defines all five required tables safely."""
+def test_staging_ddl_behavioral_schema_validation():
+    """Verify staging DDL script executes cleanly in isolated DuckDB with exact column types."""
     assert SQL_SCRIPT.exists(), f"DDL script not found at {SQL_SCRIPT}"
-    content = SQL_SCRIPT.read_text(encoding="utf-8")
-    for table_name in ("stg_clients", "stg_products", "stg_purchases", "stg_uplift_train", "stg_uplift_test"):
-        assert f"CREATE TABLE IF NOT EXISTS {table_name}" in content
-        assert "loaded_at TIMESTAMP" in content
+    cfg = DatabaseConfig(db_path=Path(":memory:"))
+    manager = DatabaseManager(config=cfg)
+    manager.execute_script(SQL_SCRIPT)
+
+    expected_schemas = {
+        "stg_clients": {
+            "client_id": "VARCHAR",
+            "first_issue_date": "TIMESTAMP",
+            "first_redeem_date": "TIMESTAMP",
+            "age": "INTEGER",
+            "gender": "VARCHAR",
+            "loaded_at": "TIMESTAMP",
+        },
+        "stg_products": {
+            "product_id": "VARCHAR",
+            "level_1": "VARCHAR",
+            "level_2": "VARCHAR",
+            "level_3": "VARCHAR",
+            "level_4": "VARCHAR",
+            "segment_id": "DOUBLE",
+            "brand_id": "VARCHAR",
+            "vendor_id": "VARCHAR",
+            "netto": "DOUBLE",
+            "is_own_trademark": "SMALLINT",
+            "is_alcohol": "SMALLINT",
+            "loaded_at": "TIMESTAMP",
+        },
+        "stg_purchases": {
+            "source_row_number": "BIGINT",
+            "client_id": "VARCHAR",
+            "transaction_id": "VARCHAR",
+            "transaction_datetime": "TIMESTAMP",
+            "regular_points_received": "DOUBLE",
+            "express_points_received": "DOUBLE",
+            "regular_points_spent": "DOUBLE",
+            "express_points_spent": "DOUBLE",
+            "purchase_sum": "DOUBLE",
+            "store_id": "VARCHAR",
+            "product_id": "VARCHAR",
+            "product_quantity": "DOUBLE",
+            "trn_sum_from_iss": "DOUBLE",
+            "trn_sum_from_red": "DOUBLE",
+            "loaded_at": "TIMESTAMP",
+        },
+        "stg_uplift_train": {
+            "client_id": "VARCHAR",
+            "treatment_flg": "SMALLINT",
+            "target": "SMALLINT",
+            "loaded_at": "TIMESTAMP",
+        },
+        "stg_uplift_test": {
+            "client_id": "VARCHAR",
+            "loaded_at": "TIMESTAMP",
+        },
+        "v_baskets": {
+            "client_id": "VARCHAR",
+            "transaction_id": "VARCHAR",
+            "transaction_datetime": "TIMESTAMP",
+            "store_id": "VARCHAR",
+            "purchase_sum": "DOUBLE",
+            "regular_points_received": "DOUBLE",
+            "regular_points_spent": "DOUBLE",
+            "basket_line_count": "BIGINT",
+            "basket_quantity": "DOUBLE",
+            "basket_trn_sum_from_iss": "DOUBLE",
+            "basket_trn_sum_from_red": "DOUBLE",
+        },
+    }
+
+    with manager.get_connection(read_only=True) as conn:
+        for relation_name, expected_cols in expected_schemas.items():
+            pragma_info = conn.execute(f"PRAGMA table_info({relation_name});").fetchall()
+            assert len(pragma_info) > 0, f"Relation {relation_name} was not created"
+            actual_cols = {row[1]: row[2] for row in pragma_info}
+            assert actual_cols == expected_cols, f"Column mismatch in {relation_name}: {actual_cols} != {expected_cols}"
+
 
 
 def test_stream_csv_sample_clients():
@@ -140,3 +212,10 @@ def test_duckdb_persistent_read_only_status():
         assert len(cols) > 0
         count = manager.fetch_row_count(tbl)
         assert count >= 0
+
+    # Confirm canonical basket view exists and is queryable
+    with manager.get_connection(read_only=True) as conn:
+        basket_check = conn.execute("SELECT client_id, transaction_id, purchase_sum FROM v_baskets LIMIT 1;").fetchone()
+        assert basket_check is not None
+        assert len(basket_check) == 3
+
