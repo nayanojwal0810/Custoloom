@@ -14,6 +14,7 @@ import argparse
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Optional
@@ -36,6 +37,35 @@ logger = logging.getLogger("custoloom.personas")
 SOURCE_MART_TABLE = "mart_customer_360"
 LOAD_PERSONAS_TABLE = "load_mart_customer_personas"
 FINAL_PERSONAS_TABLE = "mart_customer_personas"
+
+IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+PROTECTED_TABLES = frozenset([
+    "mart_customer_360",
+    "stg_clients",
+    "stg_products",
+    "stg_purchases",
+    "stg_uplift_train",
+    "stg_uplift_test",
+])
+
+
+def validate_sql_identifier(name: str, param_name: str = "table_name") -> str:
+    """Validate that a table name is a safe, valid SQL identifier without injection or whitespace.
+
+    Raises:
+        ValueError: If name is empty, non-string, or contains characters outside [a-zA-Z0-9_].
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"Invalid {param_name}: identifier cannot be empty.")
+    cleaned = name.strip()
+    if not IDENTIFIER_PATTERN.match(cleaned):
+        raise ValueError(
+            f"Invalid {param_name} '{name}': identifier must start with a letter or underscore "
+            "and contain only alphanumeric characters and underscores."
+        )
+    return cleaned
+
 
 VALID_PRIMARY_PERSONAS = (
     "non_purchaser",
@@ -211,15 +241,37 @@ PERSONA_ACTIONS: dict[str, ActionPolicy] = {
 }
 
 
-def clean_stale_persona_tables(con: duckdb.DuckDBPyConnection) -> None:
-    """Clean up any stale load-stage persona tables from interrupted runs."""
+def clean_stale_persona_tables(
+    con: duckdb.DuckDBPyConnection,
+    staging_table: str = LOAD_PERSONAS_TABLE,
+    source_table: str = SOURCE_MART_TABLE,
+) -> None:
+    """Clean up any stale load-stage persona tables from interrupted runs.
+
+    Validates that staging_table is safe, not a protected table, and does not conflict
+    with source_table before dropping.
+    """
+    stg_valid = validate_sql_identifier(staging_table, "staging_table")
+    src_valid = validate_sql_identifier(source_table, "source_table")
+
+    stg_lower = stg_valid.lower()
+    src_lower = src_valid.lower()
+
+    if stg_lower in PROTECTED_TABLES:
+        raise ValueError(f"Cannot clean protected table '{stg_valid}' as staging table.")
+    if stg_lower == src_lower:
+        raise ValueError(
+            f"Cannot clean staging table '{stg_valid}' because it matches source table '{src_valid}'."
+        )
+
     rows = con.execute(
-        "SELECT table_name FROM information_schema.tables WHERE table_name = ?;",
-        [LOAD_PERSONAS_TABLE],
+        "SELECT table_name FROM information_schema.tables WHERE lower(table_name) = ?;",
+        [stg_lower],
     ).fetchall()
     if rows:
-        logger.warning("Found stale persona table '%s'. Dropping before build...", LOAD_PERSONAS_TABLE)
-        con.execute(f"DROP TABLE IF EXISTS {LOAD_PERSONAS_TABLE};")
+        actual_name = rows[0][0]
+        logger.warning("Found stale persona table '%s'. Dropping before build...", actual_name)
+        con.execute(f"DROP TABLE IF EXISTS {actual_name};")
 
 
 def generate_personas_sql(
@@ -233,6 +285,14 @@ def generate_personas_sql(
     Injects configured thresholds and action definitions dynamically so there is
     no duplicate specification of rules across Python and SQL.
     """
+    src_valid = validate_sql_identifier(source_table, "source_table")
+    tgt_valid = validate_sql_identifier(target_table, "target_table")
+
+    if tgt_valid.lower() in PROTECTED_TABLES:
+        raise ValueError(f"Cannot generate persona SQL targeting protected table '{tgt_valid}'.")
+    if src_valid.lower() == tgt_valid.lower():
+        raise ValueError(f"Cannot generate persona SQL where source and target are the same: '{src_valid}'.")
+
     t = thresholds or PersonaThresholds()
     a = actions or PERSONA_ACTIONS
 
@@ -250,8 +310,6 @@ def generate_personas_sql(
         for persona, policy in a.items()
     )
 
-    if target_table in PROTECTED_TABLES:
-        raise ValueError(f"Cannot generate persona SQL targeting protected table '{target_table}'.")
 
     sql = f"""
     CREATE TABLE {target_table} AS
@@ -380,22 +438,24 @@ def validate_personas_stage(
     Raises:
         RuntimeError: If any validation rule fails.
     """
-    logger.info("Validating persona table '%s' against source '%s'...", target_table, source_table)
+    tgt_valid = validate_sql_identifier(target_table, "target_table")
+    src_valid = validate_sql_identifier(source_table, "source_table")
+    logger.info("Validating persona table '%s' against source '%s'...", tgt_valid, src_valid)
 
     # 1. Row count comparison
-    src_count = con.execute(f"SELECT COUNT(*) FROM {source_table};").fetchone()[0]
-    tgt_count = con.execute(f"SELECT COUNT(*) FROM {target_table};").fetchone()[0]
+    src_count = con.execute(f"SELECT COUNT(*) FROM {src_valid};").fetchone()[0]
+    tgt_count = con.execute(f"SELECT COUNT(*) FROM {tgt_valid};").fetchone()[0]
     if src_count != tgt_count:
         raise RuntimeError(
-            f"Row count mismatch: {target_table} has {tgt_count:,} rows, "
-            f"expected {src_count:,} matching {source_table}."
+            f"Row count mismatch: {tgt_valid} has {tgt_count:,} rows, "
+            f"expected {src_count:,} matching {src_valid}."
         )
 
     # 2. Grain and uniqueness check: exactly 1 row per customer
-    dist_clients = con.execute(f"SELECT COUNT(DISTINCT client_id) FROM {target_table};").fetchone()[0]
+    dist_clients = con.execute(f"SELECT COUNT(DISTINCT client_id) FROM {tgt_valid};").fetchone()[0]
     if dist_clients != tgt_count:
         raise RuntimeError(
-            f"Grain violation: {target_table} has {dist_clients:,} distinct client_ids for {tgt_count:,} rows."
+            f"Grain violation: {tgt_valid} has {dist_clients:,} distinct client_ids for {tgt_count:,} rows."
         )
 
     # 3. Completeness checks: no NULLs in critical classification fields
@@ -408,7 +468,7 @@ def validate_personas_stage(
             COUNT(CASE WHEN action_rationale IS NULL THEN 1 END) AS null_rationales,
             COUNT(CASE WHEN rule_version IS NULL THEN 1 END) AS null_versions,
             COUNT(CASE WHEN feature_cutoff_date IS NULL THEN 1 END) AS null_cutoffs
-        FROM {target_table};
+        FROM {tgt_valid};
     """).fetchone()
 
     null_field_names = [
@@ -448,14 +508,14 @@ def validate_personas_stage(
     flag_case_exprs = ", ".join(
         f"COUNT(CASE WHEN {c} NOT IN (0, 1) OR {c} IS NULL THEN 1 END)" for c in flag_columns
     )
-    invalid_flags = con.execute(f"SELECT {flag_case_exprs} FROM {target_table};").fetchone()
+    invalid_flags = con.execute(f"SELECT {flag_case_exprs} FROM {tgt_valid};").fetchone()
     for col_name, invalid_count in zip(flag_columns, invalid_flags):
         if invalid_count > 0:
             raise RuntimeError(f"Flag value violation: column '{col_name}' has {invalid_count} invalid values.")
 
     flag_counts = {}
     for col in flag_columns:
-        cnt = con.execute(f"SELECT COUNT(*) FROM {target_table} WHERE {col} = 1;").fetchone()[0]
+        cnt = con.execute(f"SELECT COUNT(*) FROM {tgt_valid} WHERE {col} = 1;").fetchone()[0]
         flag_counts[col] = cnt
 
     logger.info("Validation passed successfully: %d customers classified without gaps or nulls.", tgt_count)
@@ -467,52 +527,53 @@ def validate_personas_stage(
     }
 
 
-PROTECTED_TABLES = frozenset([
-    "mart_customer_360",
-    "stg_clients",
-    "stg_products",
-    "stg_purchases",
-    "stg_uplift_train",
-    "stg_uplift_test",
-])
-
-
 def validate_pipeline_table_names(
     source_table: str,
     target_table: str,
     staging_table: str = LOAD_PERSONAS_TABLE,
-) -> None:
+) -> tuple[str, str, str]:
     """Validate table names to prevent dangerous collisions or overwriting protected source tables.
 
     Raises:
         ValueError: If any table collision or protected table violation is detected.
     """
-    if target_table in PROTECTED_TABLES:
+    src_valid = validate_sql_identifier(source_table, "source_table")
+    tgt_valid = validate_sql_identifier(target_table, "target_table")
+    stg_valid = validate_sql_identifier(staging_table, "staging_table")
+
+    src_lower = src_valid.lower()
+    tgt_lower = tgt_valid.lower()
+    stg_lower = stg_valid.lower()
+
+    if tgt_lower in PROTECTED_TABLES:
         raise ValueError(
-            f"Configuration error: target_table cannot be protected table '{target_table}'."
+            f"Configuration error: target_table cannot be protected table '{tgt_valid}'."
         )
-    if staging_table in PROTECTED_TABLES:
+    if stg_lower in PROTECTED_TABLES:
         raise ValueError(
-            f"Configuration error: staging_table cannot be protected table '{staging_table}'."
+            f"Configuration error: staging_table cannot be protected table '{stg_valid}'."
         )
-    if source_table == target_table:
+    if src_lower == tgt_lower:
         raise ValueError(
-            f"Table collision: source_table and target_table cannot both be '{source_table}'."
+            f"Table collision: source_table and target_table cannot both be '{src_valid}' (case-insensitive)."
         )
-    if source_table == staging_table:
+    if src_lower == stg_lower:
         raise ValueError(
-            f"Table collision: source_table and staging_table cannot both be '{source_table}'."
+            f"Table collision: source_table and staging_table cannot both be '{src_valid}' (case-insensitive)."
         )
-    if target_table == staging_table:
+    if tgt_lower == stg_lower:
         raise ValueError(
-            f"Table collision: target_table and staging_table cannot both be '{target_table}'."
+            f"Table collision: target_table and staging_table cannot both be '{tgt_valid}' (case-insensitive)."
         )
+
+    return src_valid, tgt_valid, stg_valid
 
 
 def promote_personas(
     con: duckdb.DuckDBPyConnection,
     load_table: str = LOAD_PERSONAS_TABLE,
     final_table: str = FINAL_PERSONAS_TABLE,
+    source_table: Optional[str] = None,
 ) -> None:
     """Promote load-stage persona table to final production table in a safe DuckDB transaction.
 
@@ -522,36 +583,50 @@ def promote_personas(
 
     Raises:
         RuntimeError: If staging table does not exist or promotion transaction fails.
-        ValueError: If final_table is a protected table or collides with staging table.
+        ValueError: If load_table or final_table is invalid, protected, or collides.
     """
     logger.info("Promoting '%s' to '%s' in a safe transaction...", load_table, final_table)
 
-    if final_table in PROTECTED_TABLES:
-        raise ValueError(f"Cannot promote into protected table '{final_table}'.")
-    if load_table == final_table:
-        raise ValueError(f"load_table and final_table cannot be the same: '{load_table}'.")
+    load_valid = validate_sql_identifier(load_table, "load_table")
+    final_valid = validate_sql_identifier(final_table, "final_table")
+    load_lower = load_valid.lower()
+    final_lower = final_valid.lower()
 
-    # 1. Check that staging table exists before attempting promotion
+    if load_lower in PROTECTED_TABLES:
+        raise ValueError(f"Cannot promote from protected table '{load_valid}'.")
+    if final_lower in PROTECTED_TABLES:
+        raise ValueError(f"Cannot promote into protected table '{final_valid}'.")
+    if load_lower == final_lower:
+        raise ValueError(f"load_table and final_table cannot be the same: '{load_valid}'.")
+
+    if source_table is not None:
+        src_valid = validate_sql_identifier(source_table, "source_table")
+        if final_lower == src_valid.lower():
+            raise ValueError(f"final_table '{final_valid}' cannot overwrite source_table '{src_valid}'.")
+        if load_lower == src_valid.lower():
+            raise ValueError(f"load_table '{load_valid}' cannot be source_table '{src_valid}'.")
+
+    # 1. Check that staging table exists before attempting promotion (case-insensitive)
     stage_exists = con.execute(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
-        [load_table],
+        "SELECT COUNT(*) FROM information_schema.tables WHERE lower(table_name) = ?;",
+        [load_lower],
     ).fetchone()[0] > 0
     if not stage_exists:
-        err_msg = f"Promotion failed: required staging table '{load_table}' does not exist."
+        err_msg = f"Promotion failed: required staging table '{load_valid}' does not exist."
         logger.error("[ERROR] %s", err_msg)
         raise RuntimeError(err_msg)
 
     # 2. Transaction-wrapped drop and rename
     con.execute("BEGIN TRANSACTION;")
     try:
-        con.execute(f"DROP TABLE IF EXISTS {final_table};")
-        con.execute(f"ALTER TABLE {load_table} RENAME TO {final_table};")
+        con.execute(f"DROP TABLE IF EXISTS {final_valid};")
+        con.execute(f"ALTER TABLE {load_valid} RENAME TO {final_valid};")
         con.execute("COMMIT;")
-        logger.info("Successfully promoted '%s' to '%s'.", load_table, final_table)
+        logger.info("Successfully promoted '%s' to '%s'.", load_valid, final_valid)
     except Exception as err:
         con.execute("ROLLBACK;")
         err_msg = (
-            f"Promotion of '{load_table}' to '{final_table}' failed; transaction rolled back: {err}"
+            f"Promotion of '{load_valid}' to '{final_valid}' failed; transaction rolled back: {err}"
         )
         logger.error("[ERROR] %s", err_msg)
         raise RuntimeError(err_msg) from err
@@ -566,54 +641,54 @@ def run_customer_personas_pipeline(
 ) -> dict[str, Any]:
     """Execute the end-to-end customer persona classification pipeline."""
     # Fail before any database operation if table names collide or violate protection
-    validate_pipeline_table_names(
+    src_valid, tgt_valid, stg_valid = validate_pipeline_table_names(
         source_table=source_table,
         target_table=target_table,
         staging_table=staging_table,
     )
 
-    logger.info("Starting Customer Personas pipeline into '%s'...", target_table)
+    logger.info("Starting Customer Personas pipeline into '%s'...", tgt_valid)
     t_start = time.time()
 
     with manager.get_connection(read_only=False) as conn:
         exists = conn.execute(
-            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
-            [source_table],
+            "SELECT COUNT(*) FROM information_schema.tables WHERE lower(table_name) = ?;",
+            [src_valid.lower()],
         ).fetchone()[0] > 0
         if not exists:
             raise RuntimeError(
-                f"Validation error: required source table '{source_table}' does not exist. "
+                f"Validation error: required source table '{src_valid}' does not exist. "
                 "Please ensure Customer 360 mart is built before running personas."
             )
 
-        clean_stale_persona_tables(conn)
+        clean_stale_persona_tables(conn, staging_table=stg_valid, source_table=src_valid)
         build_time = build_personas_stage(
             conn,
             thresholds=thresholds,
-            source_table=source_table,
-            target_table=staging_table,
+            source_table=src_valid,
+            target_table=stg_valid,
         )
         val_summary = validate_personas_stage(
             conn,
-            target_table=staging_table,
-            source_table=source_table,
+            target_table=stg_valid,
+            source_table=src_valid,
         )
         promote_personas(
             conn,
-            load_table=staging_table,
-            final_table=target_table,
+            load_table=stg_valid,
+            final_table=tgt_valid,
+            source_table=src_valid,
         )
 
     total_time = round(time.time() - t_start, 3)
     logger.info("Customer Personas pipeline finished successfully in %.3fs.", total_time)
 
     return {
-        "target_table": target_table,
+        "target_table": tgt_valid,
         "total_customers": val_summary["total_customers"],
         "build_time_seconds": build_time,
         "total_time_seconds": total_time,
         "persona_counts": val_summary["persona_counts"],
-        "flag_counts": val_summary["flag_counts"],
     }
 
 

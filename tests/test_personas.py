@@ -14,6 +14,10 @@ from custoloom.personas import (
     SOURCE_MART_TABLE,
     LOAD_PERSONAS_TABLE,
     FINAL_PERSONAS_TABLE,
+    PROTECTED_TABLES,
+    clean_stale_persona_tables,
+    validate_pipeline_table_names,
+    validate_sql_identifier,
     build_personas_stage,
     validate_personas_stage,
     promote_personas,
@@ -334,66 +338,169 @@ def test_failed_promotion_preserves_existing_destination_table(persona_test_db):
     baseline_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
     assert len(baseline_rows) > 0
 
-    # 2. Attempt promotion with missing staging table -> raises RuntimeError, table preserved
+    # 2. Attempt promotion with missing staging table -> raises RuntimeError, destination table preserved
     with pytest.raises(RuntimeError, match="required staging table 'nonexistent_stage' does not exist"):
         promote_personas(con, load_table="nonexistent_stage", final_table=FINAL_PERSONAS_TABLE)
 
     after_missing_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
     assert after_missing_rows == baseline_rows
 
-    # 3. Simulate failure during transaction:
-    # Verify that inside BEGIN TRANSACTION, a rollback restores the dropped final_table
-    con.execute("BEGIN TRANSACTION;")
-    con.execute(f"DROP TABLE IF EXISTS {FINAL_PERSONAS_TABLE};")
-    try:
-        con.execute(f"ALTER TABLE nonexistent_table_for_rollback RENAME TO {FINAL_PERSONAS_TABLE};")
-        con.execute("COMMIT;")
-    except Exception:
-        con.execute("ROLLBACK;")
+    # 3. Trigger failure directly through promote_personas() implementation and exception handler:
+    # A DuckDB VIEW exists in information_schema.tables, passing stage_exists.
+    # But ALTER TABLE <view> RENAME TO raises CatalogException in DuckDB during the transaction.
+    # promote_personas catches this, rolls back, and raises RuntimeError.
+    con.execute("CREATE VIEW v_stage_error AS SELECT 1 AS dummy;")
+    with pytest.raises(RuntimeError, match=f"Promotion of 'v_stage_error' to '{FINAL_PERSONAS_TABLE}' failed"):
+        promote_personas(con, load_table="v_stage_error", final_table=FINAL_PERSONAS_TABLE)
 
-    # Destination table must be fully restored by ROLLBACK
+    # Destination table must be fully restored and intact after ROLLBACK in promote_personas
     after_rollback_rows = con.execute(f"SELECT client_id, primary_persona FROM {FINAL_PERSONAS_TABLE} ORDER BY client_id;").fetchall()
     assert after_rollback_rows == baseline_rows
 
 
-def test_prevent_source_mart_as_target_collision(persona_test_db):
-    """Verify attempts to use mart_customer_360 or protected tables as target fail before writes."""
+def test_case_insensitive_protected_table_and_identifier_validation(persona_test_db):
+    """Verify case-insensitive rejection of protected tables and unsafe SQL identifiers."""
     mgr, con = persona_test_db
 
-    # Attempt to target mart_customer_360
-    with pytest.raises(ValueError, match="target_table cannot be protected table 'mart_customer_360'"):
-        run_customer_personas_pipeline(manager=mgr, target_table="mart_customer_360")
+    # 1. Uppercase & mixed-case protected target tables
+    with pytest.raises(ValueError, match="target_table cannot be protected table 'MART_CUSTOMER_360'"):
+        run_customer_personas_pipeline(manager=mgr, target_table="MART_CUSTOMER_360")
 
-    # Attempt to target stg_purchases
-    with pytest.raises(ValueError, match="target_table cannot be protected table 'stg_purchases'"):
-        run_customer_personas_pipeline(manager=mgr, target_table="stg_purchases")
+    with pytest.raises(ValueError, match="target_table cannot be protected table 'StG_PuRcHaSeS'"):
+        run_customer_personas_pipeline(manager=mgr, target_table="StG_PuRcHaSeS")
 
-    # Source mart remains unchanged
+    with pytest.raises(ValueError, match="target_table cannot be protected table 'stg_CLIENTS'"):
+        run_customer_personas_pipeline(manager=mgr, target_table="stg_CLIENTS")
+
+    # 2. Uppercase & mixed-case protected staging tables
+    with pytest.raises(ValueError, match="staging_table cannot be protected table 'MART_CUSTOMER_360'"):
+        run_customer_personas_pipeline(manager=mgr, staging_table="MART_CUSTOMER_360")
+
+    with pytest.raises(ValueError, match="staging_table cannot be protected table 'StG_PuRcHaSeS'"):
+        run_customer_personas_pipeline(manager=mgr, staging_table="StG_PuRcHaSeS")
+
+    # 3. Case-insensitive table name collisions
+    with pytest.raises(ValueError, match="source_table and target_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, source_table="Custom_Mart", target_table="cUsToM_mArT"
+        )
+
+    with pytest.raises(ValueError, match="target_table and staging_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, staging_table="Stage_Mart", target_table="STAGE_MART"
+        )
+
+    with pytest.raises(ValueError, match="source_table and staging_table cannot both be"):
+        run_customer_personas_pipeline(
+            manager=mgr, source_table="My_Mart", staging_table="MY_MART"
+        )
+
+    # 4. Unsafe SQL identifiers (prevent injection and invalid characters)
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        run_customer_personas_pipeline(manager=mgr, target_table="mart_personas; DROP TABLE mart_customer_360;--")
+
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        run_customer_personas_pipeline(manager=mgr, target_table="table with spaces")
+
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        run_customer_personas_pipeline(manager=mgr, target_table="table-with-dashes")
+
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        run_customer_personas_pipeline(manager=mgr, target_table="123_invalid_start")
+
+    with pytest.raises(ValueError, match="identifier cannot be empty"):
+        run_customer_personas_pipeline(manager=mgr, target_table="  ")
+
+    # Source mart remains completely untouched
     count = con.execute("SELECT COUNT(*) FROM mart_customer_360;").fetchone()[0]
     assert count == 12
 
 
-def test_prevent_source_staging_destination_name_collisions(persona_test_db):
-    """Verify collisions among source, staging, and destination table names are rejected."""
+def test_promote_personas_direct_safety_and_protected_rejection(persona_test_db):
+    """Verify promote_personas() directly rejects protected names, collisions, and unsafe identifiers."""
     mgr, con = persona_test_db
 
-    # source == target
-    with pytest.raises(ValueError, match="source_table and target_table cannot both be"):
-        run_customer_personas_pipeline(
-            manager=mgr, source_table="custom_mart", target_table="custom_mart"
+    # Protected load table (mixed-case and uppercase)
+    with pytest.raises(ValueError, match="Cannot promote from protected table 'MART_CUSTOMER_360'"):
+        promote_personas(con, load_table="MART_CUSTOMER_360", final_table="valid_dest")
+
+    with pytest.raises(ValueError, match="Cannot promote from protected table 'StG_PuRcHaSeS'"):
+        promote_personas(con, load_table="StG_PuRcHaSeS", final_table="valid_dest")
+
+    # Protected final table (mixed-case and uppercase)
+    with pytest.raises(ValueError, match="Cannot promote into protected table 'MART_CUSTOMER_360'"):
+        promote_personas(con, load_table="valid_stage", final_table="MART_CUSTOMER_360")
+
+    with pytest.raises(ValueError, match="Cannot promote into protected table 'stg_CLIENTS'"):
+        promote_personas(con, load_table="valid_stage", final_table="stg_CLIENTS")
+
+    # Collision between load and final table (case-insensitive)
+    with pytest.raises(ValueError, match="load_table and final_table cannot be the same"):
+        promote_personas(con, load_table="SAME_NAME", final_table="same_name")
+
+    # Collision with custom source table
+    with pytest.raises(ValueError, match="final_table 'CUSTOM_SOURCE' cannot overwrite source_table 'Custom_Source'"):
+        promote_personas(
+            con,
+            load_table="valid_stage",
+            final_table="CUSTOM_SOURCE",
+            source_table="Custom_Source",
         )
 
-    # staging == target
-    with pytest.raises(ValueError, match="target_table and staging_table cannot both be"):
-        run_customer_personas_pipeline(
-            manager=mgr, staging_table="mart_customer_personas", target_table="mart_customer_personas"
+    with pytest.raises(ValueError, match="load_table 'CUSTOM_SOURCE' cannot be source_table 'Custom_Source'"):
+        promote_personas(
+            con,
+            load_table="CUSTOM_SOURCE",
+            final_table="valid_dest",
+            source_table="Custom_Source",
         )
 
-    # source == staging
-    with pytest.raises(ValueError, match="source_table and staging_table cannot both be"):
-        run_customer_personas_pipeline(
-            manager=mgr, source_table="custom_mart", staging_table="custom_mart"
-        )
+    # Unsafe identifier
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        promote_personas(con, load_table="stage; DROP TABLE test;", final_table="valid_dest")
+
+
+def test_clean_stale_persona_tables_custom_staging_preserves_source(persona_test_db):
+    """Verify clean_stale_persona_tables() cleans custom staging without touching source or unrelated tables."""
+    mgr, con = persona_test_db
+
+    con.execute("CREATE TABLE custom_source (id INT);")
+    con.execute("CREATE TABLE custom_staging (id INT);")
+    con.execute("CREATE TABLE unrelated_table (id INT);")
+
+    # Staging cleanup drops custom_staging
+    clean_stale_persona_tables(
+        con, staging_table="custom_staging", source_table="custom_source"
+    )
+
+    stage_cnt = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE lower(table_name) = 'custom_staging';"
+    ).fetchone()[0]
+    src_cnt = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE lower(table_name) = 'custom_source';"
+    ).fetchone()[0]
+    unrelated_cnt = con.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE lower(table_name) = 'unrelated_table';"
+    ).fetchone()[0]
+
+    assert stage_cnt == 0, "Expected custom_staging to be dropped by cleanup"
+    assert src_cnt == 1, "Expected custom_source to be preserved"
+    assert unrelated_cnt == 1, "Expected unrelated_table to be preserved"
+
+    # Reject attempting to clean protected tables (case-insensitive)
+    with pytest.raises(ValueError, match="Cannot clean protected table 'MART_CUSTOMER_360'"):
+        clean_stale_persona_tables(con, staging_table="MART_CUSTOMER_360", source_table="custom_source")
+
+    with pytest.raises(ValueError, match="Cannot clean protected table 'StG_PuRcHaSeS'"):
+        clean_stale_persona_tables(con, staging_table="StG_PuRcHaSeS", source_table="custom_source")
+
+    # Reject attempting to clean staging matching source (case-insensitive)
+    with pytest.raises(ValueError, match="matches source table 'custom_source'"):
+        clean_stale_persona_tables(con, staging_table="Custom_Source", source_table="custom_source")
+
+    # Reject unsafe identifier
+    with pytest.raises(ValueError, match="identifier must start with a letter or underscore"):
+        clean_stale_persona_tables(con, staging_table="invalid-name", source_table="custom_source")
 
 
 def test_personas_cli_help():
